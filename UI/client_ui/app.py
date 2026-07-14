@@ -1,9 +1,3 @@
-"""Serve the CacheRoute web client UI and bridge UI actions to client.py.
-
-This FastAPI app renders the client page, parses curl-like input through the
-existing CLI parser, validates OpenAI-style payloads, and sends requests to the
-Scheduler. It can run standalone or be mounted by another CacheRoute service.
-"""
 from __future__ import annotations
 
 import json
@@ -16,21 +10,19 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-# Reuse the existing low-level capabilities from client.py.
+# 复用你现有 client.py 的底层能力
 from client import client as client_core
 
 BASE_DIR = Path(__file__).resolve().parent          # .../UI/client_ui
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 
-
 def create_client_ui_app(
     default_scheduler_url: str = "http://127.0.0.1:7001/v1/chat/completions",
     page_title: str = "CacheRoute Client UI",
 ) -> FastAPI:
     """
-    Client UI: an independent FastAPI app that can run standalone or be mounted
-    by the Scheduler or Proxy.
+    Client UI：独立 FastAPI App，可单独启动，也可被 Scheduler/Proxy mount。
     """
     app = FastAPI(title=page_title)
 
@@ -38,7 +30,7 @@ def create_client_ui_app(
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-    # Static assets.
+    # 静态资源
     if not STATIC_DIR.exists():
         raise RuntimeError(f"Static directory not found: {STATIC_DIR}")
     if not TEMPLATES_DIR.exists():
@@ -60,8 +52,8 @@ def create_client_ui_app(
     @router.post("/ui/api/parse_curl")
     async def parse_curl(payload: Dict[str, Any]):
         """
-        Input: { "line": "<curl-like line>" }
-        Output: { url, headers, body } or error.
+        输入：{ "line": "<curl-like line>" }
+        输出：{ url, headers, body } 或 error
         """
         line = (payload.get("line") or "").strip()
         if not line:
@@ -75,8 +67,8 @@ def create_client_ui_app(
     @router.post("/ui/api/validate")
     async def validate_req(payload: Dict[str, Any]):
         """
-        Input: { "url": "...", "headers": {...}, "body": {...} }
-        Output: { ok: bool, errors: [] }.
+        输入：{ "url": "...", "headers": {...}, "body": {...} }
+        输出：{ ok: bool, errors: [] }
         """
         try:
             parsed = client_core.ParsedRequest(
@@ -92,21 +84,21 @@ def create_client_ui_app(
     @router.post("/ui/api/send")
     async def send_req(payload: Dict[str, Any]):
         """
-        Input: { "url": "...", "headers": {...}, "body": {...}, "timeout": 60 }
-        Output: { status_code, headers, body_text, body_json? }.
+        输入：{ "url": "...", "headers": {...}, "body": {...}, "timeout": 60 }
+        输出：{ status_code, headers, body_text, body_json? }
         """
         timeout = float(payload.get("timeout") or 60.0)
         url = str(payload.get("url") or "")
         headers = dict(payload.get("headers") or {})
         body = dict(payload.get("body") or {})
 
-        # Fill Content-Type in the same way as client.py.
+        # Content-Type 补齐（和 client.py 一致的行为）
         if not any(k.lower() == "content-type" for k in headers):
             headers["Content-Type"] = "application/json"
 
         parsed = client_core.ParsedRequest(url=url, headers=headers, body=body)
 
-        # Validate again before sending so the UI cannot bypass request rules.
+        # 发送前再校验一遍，避免 UI 绕开规则
         errors = client_core.validate_openai_like_request(parsed)
         if errors:
             return JSONResponse(status_code=400, content={"error": "validation_failed", "errors": errors})
@@ -121,7 +113,7 @@ def create_client_ui_app(
             "headers": dict(resp.headers),
             "body_text": resp.text,
         }
-        # Try to parse the response as JSON.
+        # 尝试 JSON 解析
         try:
             out["body_json"] = resp.json()
         except Exception:
@@ -139,7 +131,7 @@ def run_client_ui(
     default_scheduler_url: str,
 ) -> None:
     """
-    Standalone entry point: python -m UI.client_ui.app.
+    独立启动入口：python -m UI.client_ui.app
     """
     import uvicorn
 

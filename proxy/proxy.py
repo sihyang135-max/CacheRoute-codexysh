@@ -1,17 +1,17 @@
 """
 Proxy_v1.py
 ---------
-Example downstream proxy for the Scheduler:
+作为 Scheduler 的“下游代理”示例：
 
-- Asynchronously receives Request payloads (JSON) forwarded by the Scheduler
-- Parses key fields (Request_ID, Prompt, Service, Task, etc.) and restores the internal Request structure
-- Builds an OpenAI-style HTTP request body from the Request data
-- Calls the downstream Instance
-    * /v1/chat/completions  -> streaming text/event-stream
-    * /v1/completions       -> non-streaming JSON
-- Passes Instance responses through to the Scheduler (chat is streaming, completions is one-shot JSON)
+- 异步接收 Scheduler 转发的 Request payload（JSON）
+- 简单解析其中的关键信息（Request_ID、Prompt、Service、Task 等）,还原为内部 Request 结构
+- 基于 Request 中的信息，构造“OpenAI 风格”的 HTTP 请求体
+- 调用下游 Instance
+    * /v1/chat/completions  -> 流式 text/event-stream
+    * /v1/completions       -> 非流式 JSON
+- 将 Instance 的响应透传回 Scheduler（chat 为流式，completions 为一次性 JSON）
 
-Real vLLM / OpenAI / other backend services can be integrated here later.
+后续你可以在这里接入真正的 vLLM / OpenAI / 其它后端服务。
 """
 from __future__ import annotations
 
@@ -20,11 +20,12 @@ import json
 import asyncio
 import logging
 import time
+import math
 import uvicorn
 
 from contextlib import asynccontextmanager
 from dataclasses import fields
-from typing import Any, Dict, List, Tuple, AsyncGenerator
+from typing import Any, Dict, List, Tuple, AsyncGenerator, Optional
 
 from fastapi import FastAPI, Request as FastAPIRequest
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -39,7 +40,9 @@ from proxy.resource.instance_pool import InstancePool
 from proxy.resource import p_control_plane
 from proxy.resource.hb_log import HeartbeatReporter, hb_report_loop
 from proxy.strategy.factory import build_instance_strategy
+from proxy.strategy.linucb import LinUCBStrategy, Decision
 from proxy.queue import QueueManager, ProxyTask
+from proxy.metrics.prometheus_cache import PrometheusCache
 
 SCHEDULER_CP_URL = os.environ.get("SCHEDULER_CP_URL", config.SCHEDULER_CP_URL).rstrip("/")
 # KDN_BASE_URL = os.environ.get("KDN_BASE_URL", config.KDN_BASE_URL).rstrip("/")
@@ -99,41 +102,43 @@ def _squelch_noisy_loggers():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-    # uvicorn access log (optional, avoids one line per request)
+    # uvicorn access log（可选，避免每次请求一行）
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
-    # If asyncio/anyio is also noisy, add:
+    # 如果你用了 asyncio/anyio 也很吵，再加：
     # logging.getLogger("asyncio").setLevel(logging.WARNING)
     # logging.getLogger("anyio").setLevel(logging.WARNING)
 
-# ======================= Proxy initialization =======================
+# ======================= Proxy初始化 =======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Proxy lifecycle:
-      - startup: register with the scheduler control plane
-      - running: send periodic heartbeats so proxy_pool does not expire
-      - shutdown: unregister gracefully (not required; TTL handles kill -9 cases)
+    Proxy 生命周期：
+      - startup: 向 scheduler(control plane) 注册
+      - running: 周期心跳，保证 proxy_pool 不过期
+      - shutdown: 优雅注销（非强依赖，kill -9 情况靠 TTL 清理）
     """
     _squelch_noisy_loggers()
     app.state.injection_strategy_name = PROXY_INJECTION_STRATEGY  # type: ignore
     logger.info("[Proxy] injection strategy=%s", app.state.injection_strategy_name)
-    # --- Initialize the instance pool and inject it into the proxy control plane ---
+    # --- 初始化实例池，并注入proxy控制平面 ---
     ttl_s = int(os.environ.get("PROXY_INSTANCE_TTL_S", config.INSTANCE_ALIVE_TTL_S))
     app.state.instance_pool = InstancePool(ttl_s=ttl_s)  # type: ignore
     p_control_plane.set_pool(app.state.instance_pool)  # type: ignore
+    app.state.prometheus_cache = PrometheusCache()  # type: ignore
+    app.state._metrics_stop = asyncio.Event()  # type: ignore
 
-    # --- Load the proxy scheduling strategy for the data plane ---
+    # --- 加载proxy调度策略（业务面使用） ---
     strategy_name = os.environ.get("PROXY_INSTANCE_STRATEGY", "round_robin")
     try:
         app.state.instance_strategy = build_instance_strategy(strategy_name)  # type: ignore
         logger.info("[Proxy] instance strategy=%s", strategy_name)
     except Exception as e:
-        # Strategy initialization failure is fatal because the data plane cannot select an instance
+        # 策略初始化失败是致命的（否则业务面无法选择 instance）
         logger.error("[Proxy] invalid instance strategy=%s err=%s", strategy_name, str(e))
         raise
 
-    # ---Try to start the proxy control plane for interacting with Instances and dynamically refreshing the InstancePool ---
+    # ---尝试启动proxy控制平面，用于与Instance交互来动态刷新Instance池 ---
     cp_host = os.environ.get("PROXY_CP_HOST", config.PROXY_CP_HOST)
     cp_port = int(os.environ.get("PROXY_CP_PORT", config.PROXY_CP_PORT))
 
@@ -143,7 +148,7 @@ async def lifespan(app: FastAPI):
         port=cp_port,
         log_level="info",
         access_log=False,
-        # Important: do not enable reload/workers; keep embedded mode single-process and single-instance
+        # 重要：不要启用 reload / workers，embedded 场景保持单进程单实例
     )
     cp_server = uvicorn.Server(cp_config)
     app.state._cp_server = cp_server  # type: ignore
@@ -154,13 +159,13 @@ async def lifespan(app: FastAPI):
     app.state._cp_task = asyncio.create_task(_run_cp())  # type: ignore
     logger.info("[Proxy] control plane started: http://%s:%s", cp_host, cp_port)
 
-    # --- Enable the scheduler client to register with the scheduler and keep the scheduler heartbeat alive ---
+    # --- 启用scheduler客户端，尝试与scheduler交互并注册、与scheduler保活 ---
     client = SchedulerControlClient(SCHEDULER_CP_URL, timeout_s=5.0)
     app.state._sched_client = client  # type: ignore
     app.state._proxy_id = PROXY_ID    # type: ignore
     app.state._hb_stop = asyncio.Event()  # type: ignore
 
-    # --- Heartbeat log aggregation (output layer)---
+    # --- 心跳日志聚合（输出层）---
     app.state._hb_reporter = HeartbeatReporter(interval_s=30.0)  # type: ignore
     app.state._hb_report_task = asyncio.create_task(  # type: ignore
         hb_report_loop(
@@ -171,11 +176,11 @@ async def lifespan(app: FastAPI):
         )
     )
 
-    # 1) register（failure should not block data-plane startup; allow the proxy to run standalone）
+    # 1) register（失败不应阻塞业务启动：允许 proxy 单独跑）
     try:
-        # CacheRoute stage 2:
-        # Optionally inject static KDN->Proxy topology information for the Scheduler lexicographic strategy.
-        # Environment variable example:
+        # CacheRoute 第二阶段：
+        # 可选注入 KDN->Proxy 静态拓扑信息，供 Scheduler 词典序策略使用。
+        # 环境变量示例：
         # PROXY_KDN_LINKS_JSON='{"kdn_a":{"bandwidth_tier":3,"latency_tier":1}}'
         proxy_meta: Dict[str, Any] = {"version": "proxy_v1"}
         proxy_meta.update(await _build_proxy_topology_meta())
@@ -191,13 +196,13 @@ async def lifespan(app: FastAPI):
             kv_mem_per_instance_gb=PROXY_KV_MEM_PER_INSTANCE_GB,
             kv_cache_update_policy=PROXY_KV_CACHE_UPDATE_POLICY,
         )
-        # Override the local default heartbeat interval with the interval suggested by the scheduler
+        # 用 scheduler 建议的心跳周期覆盖本地默认
         interval = float(reg.heartbeat_interval_s) if reg.heartbeat_interval_s else PROXY_HEARTBEAT_S
         app.state._hb_interval = interval  # type: ignore
         logger.info("[Proxy] registered to scheduler: cp=%s proxy_id=%s advertise=%s:%s hb=%ss",
                     SCHEDULER_CP_URL, reg.proxy_id, PROXY_ADVERTISE_HOST, PROXY_ADVERTISE_PORT, interval)
     except Exception as e:
-        # Do not block the data plane: if registration fails, the proxy can still forward locally, but the scheduler cannot see it
+        # 不阻塞业务面：注册失败时 proxy 仍可本地转发（只是 scheduler 看不到它）
         app.state._hb_interval = PROXY_HEARTBEAT_S  # type: ignore
         logger.warning("[Proxy] register failed (non-fatal): cp=%s err=%s", SCHEDULER_CP_URL, str(e))
 
@@ -212,19 +217,39 @@ async def lifespan(app: FastAPI):
                 )
                 await reporter.record(ok=True)
             except Exception as e:
-                # Do not emit a warning for each event to avoid log spam; only record window statistics
+                # 不逐条 warning，避免刷屏；只记录窗口统计
                 await reporter.record(ok=False, err=str(e))
-                # If immediate stack traces are needed, change this to logger.debug(..., exc_info=True)
+                # 真要立即看到异常堆栈：你可以改成 logger.debug(..., exc_info=True)
                 logger.debug("[Proxy] heartbeat failed", exc_info=True)
 
             await asyncio.sleep(float(getattr(app.state, "_hb_interval", PROXY_HEARTBEAT_S)))  # type: ignore
 
     app.state._hb_task = asyncio.create_task(_hb_loop())  # type: ignore
 
+    async def _metrics_loop() -> None:
+        """Refresh metrics out of band; routing never blocks on Prometheus."""
+        cache: PrometheusCache = app.state.prometheus_cache  # type: ignore
+        stop: asyncio.Event = app.state._metrics_stop  # type: ignore
+        while not stop.is_set():
+            instances = app.state.instance_pool.list(include_dead=False)  # type: ignore
+            jobs = []
+            for item in instances:
+                url = str((item.meta or {}).get("metrics_url") or "").strip()
+                if url:
+                    jobs.append(cache.refresh(item.instance_id, url, config.PROXY_RL_PROMETHEUS_TIMEOUT_S))
+            if jobs:
+                await asyncio.gather(*jobs, return_exceptions=True)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=config.PROXY_RL_PROMETHEUS_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+
+    app.state._metrics_task = asyncio.create_task(_metrics_loop())  # type: ignore
+
     try:
         yield
     finally:
-        # Stop the control plane
+        # 关闭控制平面
         try:
             srv = getattr(app.state, "_cp_server", None)  # type: ignore
             t = getattr(app.state, "_cp_task", None)  # type: ignore
@@ -232,7 +257,7 @@ async def lifespan(app: FastAPI):
                 srv.should_exit = True
                 srv.force_exit = True
             if t is not None:
-                # Do not await for long; only give it a short chance to exit
+                # 不要长时间 await；给它一个很短的机会退出即可
                 try:
                     await asyncio.wait_for(t, timeout=2.0)
                 except Exception:
@@ -240,7 +265,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-        # Report to the scheduler
+        # 向scheduler汇报
         try:
             app.state._hb_stop.set()  # type: ignore
             task = getattr(app.state, "_hb_task", None)  # type: ignore
@@ -249,6 +274,10 @@ async def lifespan(app: FastAPI):
             rpt = getattr(app.state, "_hb_report_task", None)  # type: ignore
             if rpt:
                 rpt.cancel()
+            app.state._metrics_stop.set()  # type: ignore
+            metrics_task = getattr(app.state, "_metrics_task", None)  # type: ignore
+            if metrics_task:
+                metrics_task.cancel()
         except Exception:
             pass
 
@@ -264,18 +293,18 @@ async def lifespan(app: FastAPI):
             pass
 
 proxy = FastAPI(title="CacheRoute Proxy v1", lifespan=lifespan)
-queue_mgr = QueueManager()              #create the task queue manager
+queue_mgr = QueueManager()              #创建任务队列管理器
 
 
 #--------------------------------------------------------------
-# ======================= Common internal helper functions =======================
+# ======================= 公共内部处理函数 =======================
 #--------------------------------------------------------------
 
 def _dataclass_from_dict(dc_cls, data: Dict[str, Any]):
     """
-    Safely construct a dataclass from a dict:
-      - Only take fields defined by the dataclass to avoid errors from extra fields
-      - Missing required fields raise TypeError, which indicates an invalid upstream structure
+    安全地从 dict 构造 dataclass：
+      - 只取 dataclass 中定义过的字段，避免因为多余字段报错
+      - 必填字段如果缺失，会抛 TypeError，说明上游传的结构不对
     """
     if data is None:
         data = {}
@@ -286,7 +315,7 @@ def _dataclass_from_dict(dc_cls, data: Dict[str, Any]):
 
 def recover_request_from_payload(payload: Dict[str, Any]) -> SchedulerRequest:
     """
-        Restore the JSON payload sent by the Scheduler into Request, Prompt, Service, and Task dataclasses.
+        将 Scheduler 发送来的 JSON payload 恢复成 Request / Prompt / Service / Task 三个 dataclass。
     """
     req_id = payload.get("Request_ID", 0)
     req_type = payload.get("Request_type", "request")
@@ -307,7 +336,7 @@ def recover_request_from_payload(payload: Dict[str, Any]) -> SchedulerRequest:
         Task=task_obj,
     )
     logger.info(
-        "[Proxy] restored Request successfully: Request_ID=%s, Endpoint_type=%s, model=%s",
+        "[Proxy] 恢复 Request 成功: Request_ID=%s, Endpoint_type=%s, model=%s",
         req_obj.Request_ID,
         getattr(req_obj.Service, "Endpoint_type", None),
         req_obj.Prompt.model,
@@ -317,7 +346,7 @@ def recover_request_from_payload(payload: Dict[str, Any]) -> SchedulerRequest:
 
 def build_body_for_instance(req_obj: SchedulerRequest, mode: str) -> Dict[str, Any]:
     """
-        Build the OpenAI-style body sent to the Instance from the Request:
+        根据 Request 构造发给 Instance 的 OpenAI 风格 body：
           - mode="chat"        -> /v1/chat/completions
           - mode="completions" -> /v1/completions
     """
@@ -331,7 +360,7 @@ def build_body_for_instance(req_obj: SchedulerRequest, mode: str) -> Dict[str, A
     # print(f"[Proxy]stream={stream}")
 
     if mode == "chat":
-        # The Instance chat endpoint follows the OpenAI chat/completions style:
+        # Instance 的 chat 接口按 OpenAI chat/completions 风格：
         # messages = [{role: "user", content: "..."}]
         body: Dict[str, Any] = {
             "model": model,
@@ -341,14 +370,14 @@ def build_body_for_instance(req_obj: SchedulerRequest, mode: str) -> Dict[str, A
             "stream": stream,
         }
     else:
-        # completions: prompt plus non-streaming response
+        # completions：prompt + 非流式
         body = {
             "model": model,
             "prompt": user_prompt,
             "stream": False,
         }
 
-        # Add optional parameters when present; omit them otherwise
+        # 可选参数补上（有就带，没有就算了）
     if max_tokens is not None:
         body["max_tokens"] = max_tokens
     if temperature is not None:
@@ -378,9 +407,32 @@ def _sse_meta_event(task: ProxyTask) -> bytes:
     ).encode("utf-8")
 
 
+def _linucb_reward(task: ProxyTask) -> float:
+    first = task.trace.get("first_token_ms")
+    enqueued = task.trace.get("proxy_enqueue_ms")
+    slo = int(getattr(getattr(task.req_obj, "Service", None), "SLO_TTFT", 0) or 0)
+    if not isinstance(first, int) or not isinstance(enqueued, int) or slo <= 0:
+        return -5.0
+    ratio = max(0.0, (first - enqueued) / float(slo))
+    return -(min(ratio, 3.0) + (2.0 if ratio > 1.0 else 0.0))
+
+
+def _update_linucb_once(task: ProxyTask) -> None:
+    if task.trace.get("rl_updated"):
+        return
+    features = task.trace.get("rl_features")
+    strategy = getattr(proxy.state, "instance_strategy", None)
+    if not isinstance(strategy, LinUCBStrategy) or not isinstance(features, list):
+        return
+    reward = _linucb_reward(task)
+    strategy.update(features, reward)
+    task.trace["rl_updated"] = 1
+    task.trace["rl_reward_milli"] = int(reward * 1000)
+
+
 async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) -> AsyncGenerator[bytes, None]:
     """
-    Forward downstream chat SSE, but delay [DONE] and insert one cacheroute_meta event first.
+    转发下游 chat SSE，但把 [DONE] 延后，先插入一条 cacheroute_meta 事件。
     """
     pending = b""
     done_seen = False
@@ -389,6 +441,9 @@ async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) 
         async for chunk in queue_mgr.iter_response(task):
             if not chunk:
                 continue
+
+            # QueueManager records first_token_ms before placing the first chunk.
+            _update_linucb_once(task)
 
             pending += chunk
 
@@ -408,6 +463,7 @@ async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) 
         task.trace["stream_exception_ms"] = int(time.time() * 1000)
         logger.exception("[Proxy] stream wrapper failed rid=%s", task.request_id)
     finally:
+        _update_linucb_once(task)
         if pending:
             yield pending
             pending = b""
@@ -415,62 +471,105 @@ async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) 
         yield b"data: [DONE]\n\n"
 
 
-def select_instance(app: FastAPI, req_obj: SchedulerRequest):
+async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any, Optional[Decision]]:
     """
-    Select one instance for the data plane.
-    - Input: the current live instance list provided by InstancePool
-    - Output: an InstanceInfo with at least host/port/instance_id
+    业务面选择一个 instance。
+    - 输入：当前存活实例列表（由 InstancePool 提供）
+    - 输出：一个 InstanceInfo（至少有 host/port/instance_id）
     """
     pool = app.state.instance_pool  # type: ignore
     strategy = app.state.instance_strategy  # type: ignore
 
     instances = pool.list(include_dead=False)
     if not instances:
-        return None
+        return None, None
 
     try:
-        chosen = strategy.select(instances, hint=req_obj)
-        return chosen
+        if not config.PROXY_RL_ENABLED or not isinstance(strategy, LinUCBStrategy):
+            return strategy.select(instances, hint=req_obj), None
+
+        service = req_obj.Service
+        prompt = req_obj.Prompt
+        if (not bool(getattr(prompt, "stream", False))) or str(getattr(service, "Injection_type", "")).lower() != "kvcache":
+            return build_instance_strategy("least_inflight").select(instances), None
+
+        cache: PrometheusCache = app.state.prometheus_cache  # type: ignore
+        kdn_addr = str(getattr(req_obj.Task, "KDN_server_addr", "") or "")
+        prompt_len = max(0, int(getattr(prompt, "token_length", 0) or 0))
+        knowledge_len = max(0, int(getattr(service, "Knowledge_length", 0) or 0))
+        kv_len = (knowledge_len // 256) * 256
+        contexts: Dict[str, Dict[str, Any]] = {}
+        safe_instances = []
+        for item in instances:
+            metric = cache.get(item.instance_id)
+            if metric is None or not metric.is_fresh(config.PROXY_RL_PROMETHEUS_STALE_S):
+                continue
+            if metric.failures >= config.PROXY_RL_PROMETHEUS_FAILURE_LIMIT or metric.kv_usage >= config.PROXY_RL_KV_USAGE_LIMIT:
+                continue
+            q = queue_mgr.get_instance_rl_snapshot(item.instance_id)
+            if q["prepare_queue_size"] >= 256 or q["ready_queue_size"] >= 256:
+                continue
+            link = await p_control_plane.get_instance_kdn_link(item.instance_id, kdn_addr)
+            bw_mbps = max(1.0, float(link.get("bandwidth_mbps", config.INSTANCE_DEFAULT_LINK_BW_MBPS) or config.INSTANCE_DEFAULT_LINK_BW_MBPS))
+            transfer_ms = (kv_len * config.PROXY_RL_DEFAULT_KV_MB_PER_TOKEN * 8.0 * 1000.0) / bw_mbps
+            prefill_raw = q["prefill_count"] + q["prepare_queue_size"] + q["ready_queue_size"]
+            decode_raw = q["decode_count"]
+            contexts[item.instance_id] = {
+                "prompt_norm": math.log1p(prompt_len) / math.log1p(config.PROXY_RL_MAX_TOKEN_FEATURE),
+                "kv_norm": math.log1p(kv_len) / math.log1p(config.PROXY_RL_MAX_TOKEN_FEATURE),
+                "prefill_norm": min(prefill_raw, config.PROXY_RL_MAX_QUEUE_FEATURE) / config.PROXY_RL_MAX_QUEUE_FEATURE,
+                "decode_norm": min(decode_raw, config.PROXY_RL_MAX_QUEUE_FEATURE) / config.PROXY_RL_MAX_QUEUE_FEATURE,
+                "kv_usage": metric.kv_usage,
+                "net_norm": math.log1p(max(0.0, transfer_ms)) / math.log1p(1000.0),
+                "prefill_raw": prefill_raw,
+                "decode_raw": decode_raw,
+            }
+            safe_instances.append(item)
+        if len(safe_instances) < 2:
+            return build_instance_strategy("least_inflight").select(instances), None
+        decision = strategy.choose(safe_instances, contexts)
+        chosen = next(item for item in safe_instances if item.instance_id == decision.instance_id)
+        return chosen, decision
     except Exception as e:
         logger.warning("[Proxy] instance select failed: err=%s", str(e))
-        return None
+        return None, None
 
 
 #--------------------------------------------------------------
-# ======================= Local proxy route handlers =======================
+# ======================= 本地代理方法路由 =======================
 #--------------------------------------------------------------
 
 @proxy.post("/v1/chat/completions")
 async def proxy_chat_completions(request: FastAPIRequest):
     """
-    Receive /v1/chat/completions requests from the Scheduler (payload is Request JSON).
-    Forward an OpenAI chat/completions body to the worker (streaming).
+    接收来自 Scheduler 的 /v1/chat/completions 请求（payload为 Request JSON）。
+    转发为 OpenAI chat/completions body 到 Worker（流式）
     """
     proxy_recv_ms = int(time.time() * 1000)
     try:
         payload: Dict[str, Any] = await request.json()
     except Exception as e:
-        logger.exception("[Proxy] chat/completions failed to parse JSON")
+        logger.exception("[Proxy] chat/completions 解析 JSON 失败")
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_json", "detail": str(e)},
         )
 
-    # Restore the internal Request
+    # 恢复内部 Request
     try:
         req_obj = recover_request_from_payload(payload)
     except Exception as e:
-        logger.exception("[Proxy] failed to restore Request")
+        logger.exception("[Proxy] 恢复 Request 失败")
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_request_payload", "detail": str(e)},
         )
 
-    # Build the Instance request body
+    # 构造 Instance 请求体
     instance_body = build_body_for_instance(req_obj, mode="chat")
 
     route_select_start_ms = int(time.time() * 1000)
-    chosen = select_instance(proxy, req_obj)
+    chosen, rl_decision = await select_instance(proxy, req_obj)
     route_select_end_ms = int(time.time() * 1000)
     if not chosen:
         return JSONResponse(
@@ -576,10 +675,10 @@ async def proxy_chat_completions(request: FastAPIRequest):
             )
 
     # ====================================
-    # Send into the queue: enqueue -> manager -> forward
+    # 送入队列enqueue -> manager -> forward
     # ====================================
     try:
-        # 1) Wrap the task (note: chosen comes from RR and has instance_id/host/port fields)
+        # 1) 封装任务（注：chosen 来自 RR，具备 instance_id/host/port 字段 :contentReference[oaicite:5]{index=5}）
         task = ProxyTask(
             request_id=getattr(req_obj, "Request_ID", None),
             req_obj=req_obj,
@@ -593,6 +692,9 @@ async def proxy_chat_completions(request: FastAPIRequest):
         task.trace["proxy_recv_ms"] = proxy_recv_ms
         task.trace["route_select_start_ms"] = route_select_start_ms
         task.trace["route_select_end_ms"] = route_select_end_ms
+        if rl_decision is not None:
+            task.trace["rl_features"] = rl_decision.features
+            task.trace["rl_score_milli"] = int(rl_decision.score * 1000)
 
         await queue_mgr.enqueue_prepare(task)
 
@@ -600,7 +702,7 @@ async def proxy_chat_completions(request: FastAPIRequest):
         return StreamingResponse(stream_gen, media_type="text/event-stream")
 
     except Exception as e:
-        logger.exception("[Proxy] failed to call Worker(chat)")
+        logger.exception("[Proxy] 调用 Worker(chat) 失败")
         return JSONResponse(
             status_code=502,
             content={"error": "worker_chat_failed", "detail": str(e)},
@@ -611,34 +713,34 @@ async def proxy_chat_completions(request: FastAPIRequest):
 @proxy.post("/v1/completions")
 async def proxy_completions(request: FastAPIRequest):
     """
-    Receive /v1/completions requests from the Scheduler.
-    The demo logic is the same as chat/completions, but leaves room for extension.
+    接收来自 Scheduler 的 /v1/completions 请求。
+    Demo 里逻辑与 chat/completions 相同，只是留出扩展空间。
     """
     proxy_recv_ms = int(time.time() * 1000)
     try:
         payload: Dict[str, Any] = await request.json()
     except Exception as e:
-        logger.exception("[Proxy] completions failed to parse JSON")
+        logger.exception("[Proxy] completions 解析 JSON 失败")
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_json", "detail": str(e)},
         )
 
-    # Restore the internal Request
+    # 恢复内部 Request
     try:
         req_obj = recover_request_from_payload(payload)
     except Exception as e:
-        logger.exception("[Proxy] failed to restore Request")
+        logger.exception("[Proxy] 恢复 Request 失败")
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_request_payload", "detail": str(e)},
         )
 
-    # Build the Instance request body
+    # 构造 Instance 请求体
     instance_body = build_body_for_instance(req_obj, mode="completions")
 
     route_select_start_ms = int(time.time() * 1000)
-    chosen = select_instance(proxy, req_obj)
+    chosen, rl_decision = await select_instance(proxy, req_obj)
     route_select_end_ms = int(time.time() * 1000)
     if not chosen:
         return JSONResponse(
@@ -745,7 +847,7 @@ async def proxy_completions(request: FastAPIRequest):
             )
 
     # ==================================
-    # Send into the queue: enqueue -> drain -> forward
+    # 送入队列enqueue -> drain -> forward
     # ==================================
     try:
         task = ProxyTask(
@@ -769,14 +871,14 @@ async def proxy_completions(request: FastAPIRequest):
             if chunk:
                 content_bytes += chunk
 
-        # completions is non-streaming: the worker should return a one-shot JSON response
+        # completions 是非流式：worker 应该返回一次性 JSON
         if not content_bytes:
             return JSONResponse(
                 status_code=502,
                 content={"error": "empty_worker_response", "detail": "instance returned empty body"},
             )
 
-        # Try to parse as JSON; if parsing fails, return the raw text for debugging
+        # 尝试按 JSON 解析；解析失败就原样返回文本，便于排查
         try:
             obj = json.loads(content_bytes.decode("utf-8", errors="replace"))
             obj["_cacheroute_meta"] = build_cacheroute_meta(task)
@@ -791,7 +893,7 @@ async def proxy_completions(request: FastAPIRequest):
             )
 
     except Exception as e:
-        logger.exception("[Proxy] failed to call Worker(completions)")
+        logger.exception("[Proxy] 调用 Worker(completions) 失败")
         return JSONResponse(
             status_code=502,
             content={"error": "worker_completions_failed", "detail": str(e)},

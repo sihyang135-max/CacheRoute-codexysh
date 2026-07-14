@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""Run CacheRoute performance workloads and summarize request timing.
-
-This client sends workload-defined requests in concurrent or RPS mode, collects
-CacheRoute trace metadata from streaming or non-streaming responses, validates
-trace completeness, optionally samples GPU utilization, and prints compact and
-aggregate performance summaries.
-"""
 from __future__ import annotations
 
 import argparse
@@ -285,7 +278,7 @@ def calc_metrics(trace: Dict[str, int]) -> Dict[str, Optional[int]]:
     vllm_compute_to_first_token_ms = instance_exec_to_first_token_ms
 
     return {
-        # Keep compatibility with the legacy display schema.
+        # 兼容旧展示口径
         "total_prefill_ms": total_prefill_ms,
         "proxy_before_vllm_ms": proxy_before_vllm_ms,
         "proxy_queue_wait_ms": proxy_queue_wait_ms,
@@ -298,7 +291,7 @@ def calc_metrics(trace: Dict[str, int]) -> Dict[str, Optional[int]]:
         "proxy_admission_ms": proxy_admission_ms,
         "route_select_ms": route_select_ms,
 
-        # Newly split, more detailed metrics.
+        # 新拆细口径
         "prepare_queue_wait_ms": prepare_queue_wait_ms,
         "prepare_worker_gap_ms": prepare_worker_gap_ms,
         "prepare_exec_ms": prepare_exec_ms,

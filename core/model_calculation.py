@@ -1,23 +1,17 @@
-"""FLOP estimators for MLA-style model prefill computation."""
-
 # from CacheRoute.model import ModelConfig
 
 
 class MLAmodel:
-    """Estimate per-layer and full-prefill FLOPs for MLA model configs."""
 
     @classmethod
     def calc_mla_layer_flops(cls, m_cfg, task, cache_len=0) -> float:
         """
-        Estimate TFLOPs required by one MLA layer for the task prefill.
-
-        Args:
-            m_cfg: MLA model configuration with dimensions and layer settings.
-            task: Task-like object containing token_length and bs.
-            cache_len: Previous context length, defaulting to 0.
-
-        Returns:
-            Estimated per-layer compute cost in TFLOPs.
+        输入任务预计算长度，计算MLA模型单层推理所需要的flops计算量
+            model_config<MLA的模型参数>
+            task<任务信息，包含序列长度>
+            cache_len<历史会话长度，默认0>
+            输入：模型参数，任务长度
+            输出：模型对该任务每一层的计算量
         """
         heads = m_cfg.heads
         n_heads = m_cfg.n_heads
@@ -31,43 +25,46 @@ class MLAmodel:
         bs = task.bs
         context_length = seq_len + cache_len
 
-        # Q down-projection plus up-projection.
+        # Q的下采样+上采样
         q_down_proj = 2 * bs * seq_len * hidden_dim * q_lora_rank
         q_up_proj = 2 * bs * seq_len * q_lora_rank * heads * (qk_head_dim + qk_rope_head_dim)
         q_linear = q_down_proj + q_up_proj
 
-        # KV down-projection plus up-projection.
+        # KV的下采样+上采样
         kv_down_proj = 2 * bs * seq_len * hidden_dim * (kv_lora_rank + qk_rope_head_dim)
         kv_up_proj = 2 * bs * heads * context_length * kv_lora_rank * (qk_head_dim + v_head_dim)
         kv_linear = kv_down_proj + kv_up_proj
 
-        # Attention score and value aggregation computation.
+        # Attention计算
         causal_div = m_cfg.causal_mask_cof if getattr(m_cfg, "causal_mask_cof", 1) else 1
         kv_scores = (2 * bs * heads * seq_len * context_length * (qk_head_dim + qk_rope_head_dim)) // causal_div
         qkv = (2 * bs * heads * seq_len * context_length * v_head_dim) // causal_div
         attention = kv_scores + qkv
 
-        # Output projection.
+        # 输出线性层
         output = 2 * bs * seq_len * n_heads * v_head_dim * hidden_dim
 
-        layer_flops = (q_linear + kv_linear + attention + output) / 1e12   # TFLOPs
+        layer_flops = (q_linear + kv_linear + attention + output) / 1e12   # TFLOPS
 
         return layer_flops
+
 
     @classmethod
     def calc_mla_prefill_flops(cls, m_cfg, task, cache_len=0) -> float:
         """
-        Estimate total MLA prefill TFLOPs for all model layers.
-
-        Args:
-            m_cfg: MLA model configuration with model_layer.
-            task: Task-like object containing sequence length information.
-            cache_len: Previous context length, defaulting to 0.
-
-        Returns:
-            Estimated full-prefill compute cost in TFLOPs.
-        """
+                输入任务预计算长度，计算MLA模型整体Prefill所需要的flops计算量
+                    model_config<MLA的模型参数>
+                    task<任务信息，包含序列长度>
+                    cache_len<历史会话长度，默认0>
+                    输入：模型参数，任务长度
+                    输出：模型对该任务的Prefill计算量
+                """
         layer_flops = MLAmodel.calc_mla_layer_flops(m_cfg, task, cache_len)
-        prefill_flops = layer_flops * m_cfg.model_layer     # Prefill = per-layer cost * layer count.
+        prefill_flops = layer_flops * m_cfg.model_layer     # Prefill = 单层计算量 * 层数
 
         return prefill_flops
+
+
+
+
+

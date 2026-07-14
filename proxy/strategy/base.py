@@ -1,5 +1,4 @@
 # proxy/strategy/base.py
-"""Defines proxy-side instance selection strategy interfaces."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -10,17 +9,17 @@ class InstanceLike(Protocol):
     instance_id: str
     host: str
     port: int
-    weight: float  # reserved; RR does not use it yet
+    weight: float  # 预留，RR 暂不使用
 
 
 class BaseInstanceStrategy(ABC):
     """
-    Base class for proxy-side Instance selection strategies.
+    Proxy 侧 Instance 选择策略基类。
 
-    Constraints:
-    - Input: current live instance list provided by InstancePool.list(include_dead=False)
-    - Output: the selected instance, including host/port and similar fields
-    - Does not directly depend on FastAPI/request; upper layers can pass req_obj as a hint
+    约束：
+    - 输入：当前存活实例列表（由 InstancePool.list(include_dead=False) 提供）
+    - 输出：选择出的一个实例（host/port 等）
+    - 不直接依赖 FastAPI / request，上层可把 req_obj 作为 hint 传进来
     """
     name: str = "base"
 

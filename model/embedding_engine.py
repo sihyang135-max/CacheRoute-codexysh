@@ -1,4 +1,3 @@
-"""Local sentence-transformer embedding engine and scheduler prewarm helper."""
 # embedding_engine.py
 from typing import List, Union
 
@@ -13,23 +12,23 @@ from store import EmbeddingModel
 
 class EmbeddingEngine(EmbeddingModel):
     """
-    Local embedding model wrapper:
-      - Loads the model once onto GPU/CPU during startup.
-      - Provides encode_vector(texts) -> np.ndarray.
-      - Exposes dim for KnowledgeTable dimension checks.
+    本地 Embedding 模型封装：
+      - 启动时加载一次模型到 GPU/CPU
+      - 提供 encode_vector(texts) -> np.ndarray
+      - 暴露 dim 方便知识库KnowledgeTable 使用
     """
     def __init__(self, model_name: str) -> None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = device
 
-        # Enable cudnn benchmark; convolution-style models may run faster. Optional but usually helpful.
+        # 打开 cudnn benchmark，卷积类模型会快一些（非必须，但一般有益）
         if device == "cuda":
             torch.backends.cudnn.benchmark = True
 
         self._model = SentenceTransformer(model_name, device=device)
         self._model.eval()
         torch.set_grad_enabled(False)
-        # Used for knowledge-base dimension checks.
+        # 供知识库维度检查用
         self.dim = int(self._model.get_sentence_embedding_dimension())
 
     @property
@@ -45,26 +44,26 @@ class EmbeddingEngine(EmbeddingModel):
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-        return vecs  # numpy array with shape (N, dim)
+        return vecs  # (N, dim) 的 numpy 数组
 
     def prewarm_scheduler_pipeline(self, scheduler, logger=None) -> None:
         """
-            Call during scheduler startup.
-            Purpose: simulate one complete build_request flow to trigger:
+            在调度器启动阶段调用。
+            作用：模拟一次完整的 build_request 流程，触发：
                 - tokenizer
                 - embedding encode
                 - knowledge_retriever
                 - FAISS search
-            and other cold-start logic.
+            等所有冷启动逻辑。
 
-            Args:
-                scheduler: FastAPI app object for the current scheduler.
-                logger: optional logger used to print prewarm latency.
+            参数：
+                scheduler: FastAPI app 对象（你现在的 scheduler）
+                logger: 可选 logger，用于打印预热耗时
         """
         import time
-        from core import Request as SchedulerRequest  # Avoid circular imports.
+        from core import Request as SchedulerRequest  # 避免循环 import
 
-        # Read the knowledge table from scheduler.state.
+        # 从 scheduler.state 拿知识库
         knowledge_table = getattr(scheduler.state, "knowledge_table", None)
         if knowledge_table is None:
             if logger:
@@ -73,13 +72,13 @@ class EmbeddingEngine(EmbeddingModel):
                 )
             return
 
-        # Build a dummy user request in chat/completions style.
+        # 构造一条“假”的用户请求（chat/completions 风格）
         dummy_payload = {
             "model": "dummy-model",
             "messages": [
                 {
                     "role": "user",
-                    "content": "This is a scheduler prewarm test request used to trigger embedding and knowledge retrieval.",
+                    "content": "这是一次用于预热的调度测试请求，用来触发 embedding 和知识检索。",
                 }
             ],
             "max_tokens": 16,

@@ -1,5 +1,4 @@
 # instance/pclient/proxy_client.py
-"""Async client for registering Instance nodes with the Proxy control plane."""
 from __future__ import annotations
 
 from dataclasses import dataclass

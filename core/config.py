@@ -1,26 +1,27 @@
 # config.py
 """
-Configuration module: defines default parameters and constants
-- Contains constant definitions only; no runtime logic
-- Centralizes all default values
-- Provides a clear configuration reference for deployment
+配置模块：定义所有默认参数和常量
+- 仅包含常量定义，不包含任何逻辑
+- 所有默认值集中管理
+- 为生产环境提供清晰的配置参考
 """
 import sys
+import os
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-# Default model settings
-DEFAULT_MODEL = "/workspace/llm-stack/models/LLM-Research/Meta-Llama-3-70B-Instruct"  # Default main model path, used when Scheduler/Client does not specify one
-DEFAULT_MODEL_SHORTNAME = "llama3-70b"  # Default short model name for request model fields and startup script examples
-DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-large-instruct"  # Default embedding model name, used as a fallback when no local path is configured
+# 默认模型型号
+DEFAULT_MODEL = "/workspace/llm-stack/models/LLM-Research/Meta-Llama-3-70B-Instruct"  # 默认主模型路径（Scheduler/Client 未显式指定时使用）
+DEFAULT_MODEL_SHORTNAME = "llama3-70b"  # 默认模型短名（用于请求体 model 字段与启动脚本示例）
+DEFAULT_EMBED_MODEL = "intfloat/multilingual-e5-large-instruct"  # 默认embedding模型名称（当本地路径未配置时可回退）
 
 # ====================================================================#
 #                               Client                                #
 # ====================================================================#
-# Required and optional client fields; adjust validation here without touching other code.
+# 规范client的必备字段以及限制字段合集（后续要放宽/收紧，只改这里即可，不动其他代码。）
 REQUIRED_FIELDS = {
     "chat": {"model", "messages"},
     "completions": {"model", "prompt"},
@@ -34,132 +35,132 @@ ALLOWED_OPTION_FIELDS = {
 # ====================================================================#
 #                             Scheduler                               #
 # ====================================================================#
-SCHEDULER_LOG_FILE = "/workspace/llm-stack/CacheRoute/log/scheduler/"      # Log output path
-SCHEDULER_VERBOSE_REQUEST_LOG=1                                            # Enable detailed request scheduling logs when set to 1
+SCHEDULER_LOG_FILE = "/workspace/llm-stack/CacheRoute/log/scheduler/"      #日志输出路径
+SCHEDULER_VERBOSE_REQUEST_LOG=1                                            #是否开启请求调度细节输出，1为开启
 
-SCHEDULER_BASE_URL = "http://127.0.0.1:7001"                   # Scheduler data-plane URL, the default client entry point
-SCHEDULER_CP_URL = "http://127.0.0.1:7002"                     # Scheduler control-plane URL for KDN/Proxy registration and heartbeats
-EMBEDDING_MODEL = "/workspace/llm-stack/CacheRoute/model/embedder/intfloat__multilingual-e5-large-instruct"  # Embedding model path used by scheduler retrieval
-KNOWLEDGE_YAML_PATH = ROOT_DIR / "data" / "knowledge_base.yaml"  # Local knowledge manifest YAML, usable in non-KDN mode
+SCHEDULER_BASE_URL = "http://127.0.0.1:7001"                   # Scheduler业务平面URL（客户端默认请求入口）
+SCHEDULER_CP_URL = "http://127.0.0.1:7002"                     # Scheduler控制平面URL（KDN/Proxy注册与心跳入口）
+EMBEDDING_MODEL = "/workspace/llm-stack/CacheRoute/model/embedder/intfloat__multilingual-e5-large-instruct"  # Scheduler检索使用的embedding模型路径
+KNOWLEDGE_YAML_PATH = ROOT_DIR / "data" / "knowledge_base.yaml"  # 本地知识清单yaml（非KDN模式可用）
 
-# Timeout settings
-AIOHTTP_TIMEOUT = 6 * 60 * 60  # 6 hours
-SCHEDULER_KDN_AUTO_REFRESH_DEFAULT = True                       # Scheduler automatically triggers KDN refreshes
-SCHEDULER_KDN_REFRESH_INTERVAL_S_DEFAULT = 30                   # Interval in seconds for scheduler-triggered KDN knowledge refreshes
+# 超时配置
+AIOHTTP_TIMEOUT = 6 * 60 * 60  # 6小时
+SCHEDULER_KDN_AUTO_REFRESH_DEFAULT = True                       # scheduler会自动触发KDN更新
+SCHEDULER_KDN_REFRESH_INTERVAL_S_DEFAULT = 30                   # scheduler自动触发KDN知识更新的频率（秒）
 
-# Knowledge matching parameters
-SCHEDULER_RETRIEVAL_TOP_K = 1                                   # Top-k candidates retained for each knowledge retrieval
-SCHEDULER_RETRIEVAL_MIN_SCORE = 0.25                            # Minimum embedding score threshold; filters empty/weak matches, with 0.2-0.35 common for cosine scores
-SCHEDULER_RETRIEVAL_MIN_RATIO = 0.75                            # Embedding similarity ratio threshold; keep only scores >= best*0.75 to reduce knowledge pollution
+# 知识匹配参数
+SCHEDULER_RETRIEVAL_TOP_K = 1                                   # 每次知识检索保留的top-k候选数
+SCHEDULER_RETRIEVAL_MIN_SCORE = 0.25                            # embedding得分阈值下限，筛选空值，cosine 下常见起点：0.2~0.35
+SCHEDULER_RETRIEVAL_MIN_RATIO = 0.75                            # embedding相似度门限，只保留 >= best*0.75，减轻检索知识污染
 
-# Control plane
-CONTROL_PLANE_TTL_S = 30                                        # Control-plane TTL in seconds
-HEARTBEAT_INTERVAL_S = 5                                        # Heartbeat interval in seconds
-SCHEDULER_HB_REPORT_INTERVAL_S = 30                             # Heartbeat log report interval in seconds
+# 控制平面
+CONTROL_PLANE_TTL_S = 30                                        # 控制平面TTL（s）
+HEARTBEAT_INTERVAL_S = 5                                        # 心跳包间隔时间（s）
+SCHEDULER_HB_REPORT_INTERVAL_S = 30                             # 心跳包日志输出时间（s）
 
-SCHEDULER_DP_PORT = 7001                                        # Data-plane listen port
-SCHEDULER_DP_HOST = "127.0.0.1"                                 # Data-plane listen host
-SCHEDULER_CP_PORT = 7002                                        # Control-plane listen port
-SCHEDULER_CP_HOST = "127.0.0.1"                                 # Control-plane listen host
+SCHEDULER_DP_PORT = 7001                                        # 业务平面监听端口
+SCHEDULER_DP_HOST = "127.0.0.1"                                 # 业务平面监听地址
+SCHEDULER_CP_PORT = 7002                                        # 控制平面监听端口
+SCHEDULER_CP_HOST = "127.0.0.1"                                 # 控制平面监听地址
 
-# Default scheduler strategy configuration (CacheRoute)
-SCHEDULER_DEFAULT_STRATEGY = "round_robin"                      # Default scheduler strategy when demo scripts omit --strategy
-SCHEDULER_CACHEROUTE_KDN_QPS_OVERLOAD_TH = 0.0                 # CacheRoute: KDN QPS threshold; values > 0 enable overload detection
-SCHEDULER_CACHEROUTE_KDN_ITEMS_OVERLOAD_TH = 0                 # CacheRoute: KDN item-count threshold; values > 0 enable overload detection
-SCHEDULER_CACHEROUTE_KDN_PENDING_OVERLOAD_TH = 0               # CacheRoute: KDN pending_transfers threshold; values > 0 enable this check
-SCHEDULER_CACHEROUTE_KDN_ACTIVE_OVERLOAD_TH = 0                # CacheRoute: KDN active_transfers threshold; values > 0 enable this check
-SCHEDULER_CACHEROUTE_KDN_QUEUE_MS_OVERLOAD_TH = 0.0            # CacheRoute: KDN queue EMA threshold in ms; values > 0 enable this check
-SCHEDULER_CACHEROUTE_PROXY_LOAD_RATIO_DELTA = 0.1              # CacheRoute: proxy load-ratio safety window delta (0-1)
-SCHEDULER_CACHEROUTE_PROXY_INFLIGHT_DELTA = 2                  # CacheRoute: proxy safety window (min_inflight + delta)
-SCHEDULER_CACHEROUTE_PROXY_GPU_DELTA = 0.0                     # CacheRoute: proxy GPU safety window; 0 disables it
-SCHEDULER_CACHEROUTE_AFFINITY_DECAY = 0.9                      # CacheRoute: knowledge-affinity history decay factor
-SCHEDULER_CACHEROUTE_AFFINITY_TOPK = 256                       # CacheRoute: maximum affinity kid entries kept per proxy
-SCHEDULER_CACHEROUTE_LOG_DECISION = 1                          # CacheRoute: emit one decision log line per request; 1 on, 0 off
+# Scheduler策略默认配置（CacheRoute）
+SCHEDULER_DEFAULT_STRATEGY = "round_robin"                      # Scheduler默认策略（demo未指定--strategy时生效）
+SCHEDULER_CACHEROUTE_KDN_QPS_OVERLOAD_TH = 0.0                 # CacheRoute: KDN qps阈值，>0时启用过载判定
+SCHEDULER_CACHEROUTE_KDN_ITEMS_OVERLOAD_TH = 0                 # CacheRoute: KDN items阈值，>0时启用过载判定
+SCHEDULER_CACHEROUTE_KDN_PENDING_OVERLOAD_TH = 0               # CacheRoute: KDN pending_transfers阈值，>0时启用
+SCHEDULER_CACHEROUTE_KDN_ACTIVE_OVERLOAD_TH = 0                # CacheRoute: KDN active_transfers阈值，>0时启用
+SCHEDULER_CACHEROUTE_KDN_QUEUE_MS_OVERLOAD_TH = 0.0            # CacheRoute: KDN queue EMA(ms)阈值，>0时启用
+SCHEDULER_CACHEROUTE_PROXY_LOAD_RATIO_DELTA = 0.1              # CacheRoute: proxy负载比例安全窗口delta（0~1）
+SCHEDULER_CACHEROUTE_PROXY_INFLIGHT_DELTA = 2                  # CacheRoute: proxy安全窗口（min_inflight + delta）
+SCHEDULER_CACHEROUTE_PROXY_GPU_DELTA = 0.0                     # CacheRoute: proxy GPU安全窗口（0表示不启用）
+SCHEDULER_CACHEROUTE_AFFINITY_DECAY = 0.9                      # CacheRoute: 知识亲和历史衰减系数
+SCHEDULER_CACHEROUTE_AFFINITY_TOPK = 256                       # CacheRoute: 每个proxy保留的亲和kid数量上限
+SCHEDULER_CACHEROUTE_LOG_DECISION = 1                          # CacheRoute: 是否输出每请求一行决策日志（1开0关）
 # ====================================================================#
 #                               Proxy                                 #
 # ====================================================================#
-PROXY_BASE_URL = "http://127.0.0.1:8001"                       # Default Proxy data-plane URL
-PROXY_CP_URL = "http://127.0.0.1:8002"                         # Default Proxy control-plane URL
-PROXY_DP_HOST = "127.0.0.1"                                    # Proxy data-plane listen host
-PROXY_DP_PORT = 8001                                            # Proxy data-plane listen port
-PROXY_CP_HOST = "127.0.0.1"                                    # Proxy control-plane listen host
-PROXY_CP_PORT = 8002                                            # Proxy control-plane listen port
+PROXY_BASE_URL = "http://127.0.0.1:8001"                       # Proxy业务平面默认URL
+PROXY_CP_URL = "http://127.0.0.1:8002"                         # Proxy控制平面默认URL
+PROXY_DP_HOST = "127.0.0.1"                                    # Proxy业务平面监听地址
+PROXY_DP_PORT = 8001                                            # Proxy业务平面监听端口
+PROXY_CP_HOST = "127.0.0.1"                                    # Proxy控制平面监听地址
+PROXY_CP_PORT = 8002                                            # Proxy控制平面监听端口
 
-INSTANCE_ALIVE_TTL_S = 30                                      # Instance heartbeat TTL from the Proxy perspective, in seconds
+INSTANCE_ALIVE_TTL_S = 30                                      # Proxy视角下Instance心跳TTL（秒）
 
-PROXY_MAX_CAPACITY = 8                                          # Maximum concurrent tasks supported by the Proxy-managed instance pool; used to estimate queueing
-PROXY_INSTANCE_COUNT = 1                                        # Number of instance devices managed by Proxy
-PROXY_KV_MEM_PER_INSTANCE_GB = 128                              # KVCache capacity per Proxy-managed instance device
-PROXY_KV_CACHE_UPDATE_POLICY = "lru"                            # KVCache update policy for Proxy-managed instances
-PROXY_KDN_LINKS_JSON = ""                                       # Optional static topology tier JSON string
+PROXY_MAX_CAPACITY = 8                                          # Proxy管理实例池支持的最大并发任务数，衡量排队情况
+PROXY_INSTANCE_COUNT = 1                                        # Proxy管理实例设备数量
+PROXY_KV_MEM_PER_INSTANCE_GB = 128                              # Proxy管理实例设备的KVCache缓存大小
+PROXY_KV_CACHE_UPDATE_POLICY = "lru"                            # Proxy管理实例的KVCache更新策略
+PROXY_KDN_LINKS_JSON = ""                                       # 可选：静态拓扑 tier JSON 字符串
 
-PREPARE_CONCURRENCY = 8                                         # Maximum concurrent knowledge preparation tasks per Proxy instance
-READY_CONCURRENCY = 8                                           # Maximum concurrent inference tasks per Proxy instance
+PREPARE_CONCURRENCY = 8                                         # Proxy每个实例允许的最大并发知识准备任务数
+READY_CONCURRENCY = 8                                           # Proxy每个实例允许的最大并发推理任务数
+
+# 二级 LinUCB 调度（Proxy -> Instance）
+PROXY_RL_ENABLED = bool(int(os.environ.get("PROXY_RL_ENABLED", "1")))
+PROXY_RL_ALPHA = float(os.environ.get("PROXY_RL_ALPHA", "0.4"))
+PROXY_RL_LAMBDA = float(os.environ.get("PROXY_RL_LAMBDA", "1.0"))
+PROXY_RL_WARMUP_REQUESTS = int(os.environ.get("PROXY_RL_WARMUP_REQUESTS", "30"))
+PROXY_RL_KV_USAGE_LIMIT = float(os.environ.get("PROXY_RL_KV_USAGE_LIMIT", "0.90"))
+PROXY_RL_PROMETHEUS_INTERVAL_S = float(os.environ.get("PROXY_RL_PROMETHEUS_INTERVAL_S", "1.0"))
+PROXY_RL_PROMETHEUS_TIMEOUT_S = float(os.environ.get("PROXY_RL_PROMETHEUS_TIMEOUT_S", "0.2"))
+PROXY_RL_PROMETHEUS_STALE_S = float(os.environ.get("PROXY_RL_PROMETHEUS_STALE_S", "3.0"))
+PROXY_RL_PROMETHEUS_FAILURE_LIMIT = int(os.environ.get("PROXY_RL_PROMETHEUS_FAILURE_LIMIT", "3"))
+PROXY_RL_MAX_QUEUE_FEATURE = int(os.environ.get("PROXY_RL_MAX_QUEUE_FEATURE", "8"))
+PROXY_RL_MAX_TOKEN_FEATURE = int(os.environ.get("PROXY_RL_MAX_TOKEN_FEATURE", "4096"))
+PROXY_RL_DEFAULT_KV_MB_PER_TOKEN = float(os.environ.get("PROXY_RL_DEFAULT_KV_MB_PER_TOKEN", "0.096"))
 # ====================================================================#
 #                              Instance                               #
 # ====================================================================#
-INSTANCE_BASE_URL = "http://127.0.0.1:9001"                    # Default Instance data-plane URL
-INSTANCE_HOST = "127.0.0.1"                                    # Instance listen host
-INSTANCE_PORT = 9001                                            # Instance listen port
-INSTANCE_CP_HOST = "127.0.0.1"                                 # Instance control-plane listen host
-INSTANCE_CP_PORT = 9002                                         # Instance control-plane listen port
-VLLM_BASE_URL = "http://127.0.0.1:8000"                        # Downstream vLLM OpenAI-compatible API URL
-USE_MOCK = False                                 # Local testing flag
+INSTANCE_BASE_URL = "http://127.0.0.1:9001"                    # Instance业务平面默认URL
+INSTANCE_HOST = "127.0.0.1"                                    # Instance监听地址
+INSTANCE_PORT = 9001                                            # Instance监听端口
+INSTANCE_CP_HOST = "127.0.0.1"                                 # Instance控制平面监听地址
+INSTANCE_CP_PORT = 9002                                         # Instance控制平面监听端口
+VLLM_BASE_URL = "http://127.0.0.1:8000"                        # 下游vLLM OpenAI兼容接口URL
+USE_MOCK = False                                 # 本地测试标签
 
-INSTANCE_REDIS_HOST = "127.0.0.1"                              # Redis host used by Instance for KV injection/reuse
-INSTANCE_REDIS_PORT = 6379                                     # Redis port
-INSTANCE_REDIS_DB = 0                                          # Redis database number
-INSTANCE_REDIS_PASSWORD = None                                 # Redis password; None means no password
-INSTANCE_TOPOLOGY_KDN_TARGETS = ""                             # Instance auto topology discovery targets, comma-separated host:port or URLs
-INSTANCE_DEFAULT_LINK_BW_MBPS = 1000.0                         # Fallback link bandwidth when NIC speed cannot be read
-
-# Instance resource monitoring, enabled by default in demos; disable with --no-resource-monitor or INSTANCE_RESOURCE_MONITOR_ENABLE=0
-INSTANCE_RESOURCE_MONITOR_ENABLE = True                         # Enable Instance-side resource monitoring by default.
-INSTANCE_RESOURCE_AUTO_START_AGENT = True                       # Auto-start the local resource agent when the Instance starts.
-INSTANCE_RESOURCE_AGENT_HOST = "127.0.0.1"                      # Host address used by the Instance resource agent.
-INSTANCE_RESOURCE_AGENT_PORT = 9201                             # Port used by the Instance resource agent.
-INSTANCE_RESOURCE_AGENT_LISTEN = "127.0.0.1:9201"               # Listen address for the Instance resource agent.
-INSTANCE_RESOURCE_AGENT_URL = "http://127.0.0.1:9201"           # Base URL used by Instance to query the resource agent.
-INSTANCE_RESOURCE_AGENT_SAMPLE_INTERVAL_MS = 1000               # Resource agent sampling interval in milliseconds.
-INSTANCE_RESOURCE_AGENT_START_TIMEOUT_S = 60.0                  # Maximum wait time for the resource agent to become ready.
-INSTANCE_RESOURCE_REPORT_ENABLE = False                         # Enable periodic Instance resource reports to the control plane.
-INSTANCE_RESOURCE_REPORT_HZ = 1.0                               # Resource report frequency in reports per second.
-INSTANCE_RESOURCE_REPORT_INTERVAL_MS = 1000                     # Resource report interval in milliseconds.
-INSTANCE_RESOURCE_REPORT_TIMEOUT_S = 2.0                        # Timeout for sending one resource report.
+INSTANCE_REDIS_HOST = "127.0.0.1"                              # Instance侧访问Redis地址（KV注入/复用）
+INSTANCE_REDIS_PORT = 6379                                     # Redis端口
+INSTANCE_REDIS_DB = 0                                          # Redis数据库编号
+INSTANCE_REDIS_PASSWORD = None                                 # Redis密码（None表示无密码）
+INSTANCE_TOPOLOGY_KDN_TARGETS = ""                             # Instance自动拓扑发现目标（逗号分隔 host:port 或 URL）
+INSTANCE_DEFAULT_LINK_BW_MBPS = 1000.0                         # 兜底链路带宽（无法读取网卡速率时）
 
 # ====================================================================#
 #                               Other                                 #
 # ====================================================================#
-CLIENT_URL = "http://127.0.0.1:7071"                           # Local demo client service URL
-# Default proxy configuration
-DEFAULT_PREFILL = ["172.18.0.169:8001"]                        # Reserved: default prefill proxy list
-DEFAULT_DECODE = ["172.18.0.169:8082"]                         # Reserved: default decode proxy list
+CLIENT_URL = "http://127.0.0.1:7071"                           # demo client本地服务URL
+# 默认代理配置
+DEFAULT_PREFILL = ["172.18.0.169:8001"]                        # 预留：prefill默认代理列表
+DEFAULT_DECODE = ["172.18.0.169:8082"]                         # 预留：decode默认代理列表
 
 
 # ====================================================================#
 #                             KDN Server                              #
 # ====================================================================#
-KDN_BASE_URL = "http://127.0.0.1:9101"                          # KDN server URL
-KDN_HOST = "127.0.0.1"                                         # KDN listen host
-KDN_PORT = 9101                                                 # KDN listen port
-KDN_NETWORK_ENABLE = False                                      # Whether KDN network simulation is enabled by default
-KDN_NETWORK_BW_MB_S = 125.0                                     # Total bandwidth for KDN network simulation (MB/s)
-KDN_NETWORK_BATCH_WINDOW_MS = 10.0                              # Batch window for KDN network simulation (ms)
-KDN_NETWORK_FIXED_LATENCY_MS = 10.0                             # Fixed latency for KDN network simulation (ms)
-KDN_NETWORK_EFFICIENCY = 0.8                                    # Bandwidth efficiency factor for KDN network simulation (0,1]
-KDN_REDIS_REWRITE_ENABLE = False                                # Whether KDN rewrites Redis target addresses; disabled by default and does not affect the original path
-KDN_REWRITE_LOOPBACK_TO = ""                                    # Optional target for rewriting loopback addresses only
-KDN_FORCE_REDIS_HOST = ""                                       # Optional override for all Redis target addresses
-DEFAULT_WARN_LEN = 4000                                         # Warn when registered text exceeds this length; file-path registration is recommended
-# build_kv defaults, kept consistent with server defaults
-DEFAULT_API_URL = "http://127.0.0.1:8000/v1/chat/completions"   # vLLM service URL used when building KVCache blocks
-DEFAULT_MAX_TOKENS = 1                                          # Maximum decode tokens, usually 1
-DEFAULT_TEMPERATURE = 0.0                                       # Temperature model parameter; does not affect KVCache blocks
-DEFAULT_REDIS_HOST = "127.0.0.1"                                # Redis storage host
-DEFAULT_REDIS_PORT = 6379                                       # Redis storage port
-DEFAULT_REDIS_DB = 0                                            # Redis DBSIZE is expected to be 0 at initialization because differential capture is used
-DEFAULT_MATCH = "vllm@*"                                        # KEYS prefix used when dumping KVCache
-DEFAULT_SCAN_COUNT = 1000                                       # Scan count; the default is sufficient
+KDN_BASE_URL = "http://127.0.0.1:9101"                          # KDN服务器URL
+KDN_HOST = "127.0.0.1"                                         # KDN监听地址
+KDN_PORT = 9101                                                 # KDN监听端口
+KDN_NETWORK_ENABLE = False                                      # KDN网络模拟默认是否启用
+KDN_NETWORK_BW_MB_S = 125.0                                     # KDN网络模拟总带宽（MB/s）
+KDN_NETWORK_BATCH_WINDOW_MS = 10.0                              # KDN网络模拟批处理窗口（ms）
+KDN_NETWORK_FIXED_LATENCY_MS = 10.0                             # KDN网络模拟固定时延（ms）
+KDN_NETWORK_EFFICIENCY = 0.8                                    # KDN网络模拟带宽效率系数（0,1]
+KDN_REDIS_REWRITE_ENABLE = False                                # KDN是否启用redis目标地址重写（默认关闭，不影响原路径）
+KDN_REWRITE_LOOPBACK_TO = ""                                    # 可选：仅将loopback目标重写为该地址
+KDN_FORCE_REDIS_HOST = ""                                       # 可选：无条件覆盖redis目标地址
+DEFAULT_WARN_LEN = 4000                                         # 注册文本超过该长度则会警告，建议通过文件路径方式注册
+# build_kv 的默认值（与你服务端默认保持一致）
+DEFAULT_API_URL = "http://127.0.0.1:8000/v1/chat/completions"   # 构建KVCache块时送入的vllm服务url
+DEFAULT_MAX_TOKENS = 1                                          # 最大decode token数，一般为1
+DEFAULT_TEMPERATURE = 0.0                                       # 温度，模型参数，对KVCache块无影响
+DEFAULT_REDIS_HOST = "127.0.0.1"                                # 存储的Redis服务器地址
+DEFAULT_REDIS_PORT = 6379                                       # 存储的Redis服务器端口号
+DEFAULT_REDIS_DB = 0                                            # 由于采用差分抓取，默认初始化时Redis服务器的DBSIZE=0
+DEFAULT_MATCH = "vllm@*"                                        # 在dump KVCache时用的KEYS统一前缀
+DEFAULT_SCAN_COUNT = 1000                                       # 扫描轮次，默认值即可
 
 
 
@@ -167,27 +168,27 @@ DEFAULT_SCAN_COUNT = 1000                                       # Scan count; th
 
 
 
-# Service configuration
-DEFAULT_PORT = 8081                                             # Reserved: legacy module default service port
-DEFAULT_HOST = "172.18.0.169"                                   # Reserved: legacy module default service host
+# 服务配置
+DEFAULT_PORT = 8081                                             # 预留：历史模块默认服务端口
+DEFAULT_HOST = "172.18.0.169"                                   # 预留：历史模块默认服务地址
 
-# Command dispatch timeout
+# 下发指令超时时间
 DISPATCH_TIMEOUT = 10  # 10s
 
-# Report threshold
-REPORT_THRESHOLD = 1                                            # Reserved: status report threshold
+# 上报阈值
+REPORT_THRESHOLD = 1                                            # 预留：状态上报阈值
 
-# Report label
-REPORT_LABEL = "172.18.0.169:8081"                              # Reserved: status report label
+# 上报标签
+REPORT_LABEL = "172.18.0.169:8081"                              # 预留：状态上报标签
 
-# Sync setting: whether to enable synchronization
-USE_SYN = True                                                  # Reserved: whether to enable synchronized dispatch mode
-# Sync setting: batch size
-SYN_BATCH_SIZE = 3                                              # Reserved: per-batch size in sync mode
-# Sync setting: wait timeout in seconds
-SYN_TIMEOUT = 3                                                 # Reserved: sync-mode wait timeout in seconds
+# 同步设置 是否启用同步
+USE_SYN = True                                                  # 预留：是否启用同步下发模式
+# 同步设置 批处理批次
+SYN_BATCH_SIZE = 3                                              # 预留：同步模式下每批处理大小
+# 同步设置 等待时间 秒
+SYN_TIMEOUT = 3                                                 # 预留：同步模式等待超时（秒）
 
-# RDMA configuration: protocol, choose "tcp" or "rdma"
-MOONCAKE_PROTOCOL = "tcp"                                       # Reserved: Mooncake communication protocol (tcp/rdma)
-# RDMA configuration: device name, choose "" or "mlx5_0"
-MOONCAKE_DEVICE_NAME = ""                                       # Reserved: RDMA device name; empty means unspecified
+# RDMA配置 协议  可选 "tcp" or "rdma"
+MOONCAKE_PROTOCOL = "tcp"                                       # 预留：Mooncake通信协议（tcp/rdma）
+# RDMA配置 设备名 可选 "" or "mlx5_0"
+MOONCAKE_DEVICE_NAME = ""                                       # 预留：RDMA设备名（空表示不指定）

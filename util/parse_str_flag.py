@@ -1,11 +1,11 @@
 def parse_stream_flag(stream_val) -> bool:
     """
-    Parse the stream field from the frontend / Scheduler / Proxy,
-    Accepted input types:
+    解析来自前端 / Scheduler / Proxy 的 stream 字段，
+    允许输入类型：
       - bool: True / False
-      - str: "true", "false", "1", "0", "yes", "no"(case-insensitive)
+      - str: "true", "false", "1", "0", "yes", "no"（大小写不敏感）
       - int: 1 / 0
-    All other cases are treated as False.
+    其他情况一律视为 False。
     """
     if isinstance(stream_val, bool):
         return stream_val
@@ -20,5 +20,5 @@ def parse_stream_flag(stream_val) -> bool:
         if val in ("false", "0", "no", "n"):
             return False
 
-    # Unknown type or value: disable streaming by default
+    # 未知类型或值 —— 默认关闭流式
     return False

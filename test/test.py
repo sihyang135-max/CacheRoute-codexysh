@@ -1,31 +1,31 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Parameter settings
+# 参数设置
 a = 2
 b = 3
 
-# Vertical asymptote position
+# 垂直渐近线位置
 x0 = -b / a
 
-# Define the x-axis range while avoiding the asymptote
+# 定义 x 轴范围，避开渐近线
 x_left = np.linspace(x0 - 5, x0 - 0.1, 400)
 x_right = np.linspace(x0 + 0.1, x0 + 5, 400)
 
-# Define function
+# 定义函数
 def f(x):
     return (a * x) / (a * x + b)
 
-# Plot
+# 绘图
 plt.figure(figsize=(8, 5))
 
 plt.plot(x_left, f(x_left))
 plt.plot(x_right, f(x_right))
 
-# Draw horizontal asymptote y = 1
+# 绘制水平渐近线 y = 1
 plt.axhline(1, linestyle="--")
 
-# Draw vertical asymptote x = -b/a
+# 绘制垂直渐近线 x = -b/a
 plt.axvline(x0, linestyle="--")
 
 plt.xlabel("x")

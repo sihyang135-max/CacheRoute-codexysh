@@ -3,17 +3,17 @@
 
     Usage:
         from tokenizer_registry import estimate_tokens
-        n = estimate_tokens("hello, world", tokenizer_type="qwen1.5b")
+        n = estimate_tokens("你好，世界", tokenizer_type="qwen1.5b")
 
     Workflow
-        Names containing "qwen" use the Qwen tokenizer path.
-        Names containing "llama" use the LLaMA tokenizer path.
-        Names containing "deepseek" use the DeepSeek tokenizer path.
-        Names starting with "gpt" or containing "gpt-3"/"gpt-4" use GPT via tiktoken.
+        名字中包含 "qwen" → 走 Qwen
+        包含 "llama" → 走 LLaMA
+        包含 "deepseek" → 走 DeepSeek
+        以 "gpt" 开头或含 "gpt-3"/"gpt-4" → 走 GPT（tiktoken）
 
-        If transformers is unavailable, skip Hugging Face tokenizers.
-        If tiktoken is unavailable, skip GPT-specific logic.
-        If all paths fail, fall back to len(text) without raising.
+        没有 transformers：直接跳过 HF tokenizer
+        没有 tiktoken：直接跳过 GPT 专用逻辑
+        全都失败：len(text) 兜底，不会报错
 """
 import json
 import os
@@ -22,7 +22,7 @@ from functools import lru_cache
 from typing import Optional
 # from CacheRoute.util.timer import timing
 
-# These libraries are optional, so guard imports with try/except.
+# 这些库可能不存在，所以用 try/except 处理
 try:
     from transformers import AutoTokenizer
 except ImportError:
@@ -36,31 +36,31 @@ except ImportError:
 
 class TokenizerRegistry:
     """
-    Manage tokenizers across model families and route by model name.
-    FAST_MODE enables approximate token counting when True; False uses normal tokenizers.
+    统一管理不同模型族的 tokenizer，并提供按模型名自动路由的能力。
+    FAST_MODE:是否启用快分词加速处理，TRUE启用，False执行正常的tokenizer分词。
     """
     FAST_MODE = False
 
-    # Extend this mapping when additional naming conventions are needed.
-    # Keys are model families; values are default Hugging Face model names.
+    # 可以根据你自己的命名规则再继续加
+    # key 是“模型族”，value 是默认的 HF 模型名
     HF_FAMILY_DEFAULTS = {
         "qwen": "Qwen/Qwen2-1.5B",
         "llama": "meta-llama/Meta-Llama-3-70B",
-        "deepseek": "deepseek-ai/deepseek-moe-16b",  # Replace with a preferred default if needed.
+        "deepseek": "deepseek-ai/deepseek-moe-16b",  # 你可以换成自己常用的
     }
 
     @classmethod
     def _is_local_model_dir(cls, name: str) -> bool:
         """
-        Return whether name is a local model directory rather than a Hugging Face repo id.
-        A local directory should exist and contain at least one tokenizer marker file.
+        判断 name 是否是本地模型目录（而不是 Hugging Face repo id）。
+        经验上：本地目录应当存在，且包含 tokenizer 文件之一。
         """
         if not name:
             return False
         if not os.path.isdir(name):
             return False
 
-        # Common tokenizer marker files include tokenizer.json, tokenizer.model, vocab.json, merges.txt, and special_tokens_map.json.
+        # 常见 tokenizer 文件：tokenizer.json / tokenizer.model / vocab.json / merges.txt / special_tokens_map.json 等
         markers = [
             "tokenizer.json",
             "tokenizer.model",
@@ -74,7 +74,7 @@ class TokenizerRegistry:
     @classmethod
     def detect_family(cls, tokenizer_type: str) -> str:
         """
-        Infer the tokenizer family from the model name or type: qwen, llama, deepseek, gpt, or other.
+        根据模型名/类型推断属于哪个族：qwen / llama / deepseek / gpt / other
         """
         name = tokenizer_type.lower()
 
@@ -87,22 +87,22 @@ class TokenizerRegistry:
         if name.startswith("gpt") or "gpt-3" in name or "gpt-4" in name:
             return "gpt"
 
-        # Fall back to the generic other family.
+        # 兜底归为 other
         return "other"
 
     @classmethod
     def _resolve_tokenizer_source(cls, model_name: str) -> str:
         """
-        Resolve served model names, repo ids, and local paths into tokenizer loading sources.
-        - Return local directories directly.
-        - Return mapped local directories when SCHEDULER_TOKENIZER_MAP contains the name.
-        - Otherwise return the original value, which may be a repo id.
+        把 served-model-name / repo id / 本地路径 统一解析成 tokenizer 的加载源：
+        - 如果是本地目录：返回本地目录
+        - 如果在映射表里：返回映射到的本地目录
+        - 否则原样返回（可能是 repo id）
         """
-        # 1) Return local directories directly.
+        # 1) 本地目录直接返回
         if cls._is_local_model_dir(model_name):
             return model_name
 
-        # 2) Apply served-name mapping.
+        # 2) served-name 映射
         raw = os.getenv("SCHEDULER_TOKENIZER_MAP", "").strip()
         if raw:
             try:
@@ -112,10 +112,10 @@ class TokenizerRegistry:
             except Exception:
                 pass
 
-        # 3) Fallback: return the original value.
+        # 3) fallback：原样
         return model_name
 
-    # ---------------- GPT family (tiktoken) ----------------
+    # ---------------- GPT 系列（tiktoken） ----------------
 
     @classmethod
     @lru_cache(maxsize=None)
@@ -126,7 +126,7 @@ class TokenizerRegistry:
         try:
             return tiktoken.encoding_for_model(model_name)
         except Exception:
-            # If the concrete model is unknown, use the generic cl100k_base encoding.
+            # 如果具体模型不识别，就用通用的 cl100k_base
             try:
                 return tiktoken.get_encoding("cl100k_base")
             except Exception:
@@ -137,10 +137,10 @@ class TokenizerRegistry:
         enc = cls._get_gpt_encoding(model_name)
         if enc is None:
             return None
-        # tiktoken returns list[int].
+        # tiktoken 返回的是 list[int]
         return len(enc.encode(text))
 
-    # ---------------- HF families (Qwen / LLaMA / DeepSeek) ----------------
+    # ---------------- HF 系列（Qwen / LLaMA / DeepSeek） ----------------
 
 
     @classmethod
@@ -153,7 +153,7 @@ class TokenizerRegistry:
         try:
             is_local = cls._is_local_model_dir(hf_model_name)
 
-            # Local directories: force local loading and avoid network probes.
+            # 本地目录：强制只从本地加载，避免任何联网探测
             return AutoTokenizer.from_pretrained(
                 hf_model_name,
                 trust_remote_code=True,
@@ -167,19 +167,19 @@ class TokenizerRegistry:
     # @timing
     def _hf_count_tokens(cls, text: str, family: str, model_name: str) -> Optional[int]:
         """
-        Count tokens for Hugging Face models. Prefer local tokenizer directories, then repo ids or family defaults.
+        对 HF 模型计数。优先使用本地 tokenizer 目录，其次才用 repo id / family 默认。
         """
         model_name = cls._resolve_tokenizer_source(model_name)
 
-        # 1) Prefer local directories.
+        # 1) 本地目录优先
         if cls._is_local_model_dir(model_name):
             hf_name = model_name
         else:
-            # 2) If it looks like a repo id, use it directly.
+            # 2) 如果像 repo id（包含一个 / 但不是本地目录），直接用它
             if "/" in model_name:
                 hf_name = model_name
             else:
-                # 3) Otherwise use the family default.
+                # 3) 否则用 family 默认
                 hf_name = cls.HF_FAMILY_DEFAULTS.get(family)
 
         if hf_name is None:
@@ -194,16 +194,16 @@ class TokenizerRegistry:
         except Exception:
             return None
 
-    # ---------------- Public API ----------------
+    # ---------------- 对外统一接口 ----------------
 
     @classmethod
     def estimate_tokens(cls, text: str, model_name: str) -> int:
         """
-        Select a tokenizer by model name and return the token count.
-        If transformers/tiktoken is unavailable or tokenization fails, fall back to len(text).
+        按模型名自动选择 tokenizer，返回 token 数。
+        如果环境里缺少 transformers/tiktoken 或解析失败，则退化为 len(text)。
 
-        :param text: Input text.
-        :param model_name: Model name or type, for example:
+        :param text: 输入文本
+        :param model_name: 模型名或模型类型，如
                            'qwen1.5b' / 'Qwen/Qwen2-1.5B'
                            'llama3-8b'
                            'deepseek-v2'
@@ -211,10 +211,10 @@ class TokenizerRegistry:
         """
         family = cls.detect_family(model_name)
 
-        # --- Fast approximate mode: skip slower tokenizer initialization entirely. ---
+        # --- 快速近似模式：完全跳过慢 tokenizer ---
         if cls.FAST_MODE:
             print("use Fast tokenizer")
-            # Family-specific scaling factors can be tuned later.
+            # 可以按族给一个缩放系数，便于之后细调
             rough_ratio = {
                 "deepseek": 1.0,
                 "qwen": 1.0,
@@ -223,32 +223,32 @@ class TokenizerRegistry:
             }.get(family, 1.0)
             return int(len(text) * rough_ratio)
 
-        # 1) GPT family -> tiktoken.
+        # 1) GPT 系列 → tiktoken
         if family == "gpt":
             print(f"[TokenizerRegistry] user tokenizer {model_name} ")
             n = cls._gpt_count_tokens(text, model_name)
             if n is not None:
                 return n
 
-        # 2) Qwen / LLaMA / DeepSeek -> Hugging Face tokenizer.
+        # 2) Qwen / LLaMA / DeepSeek → HF tokenizer
         if family in {"qwen", "llama", "deepseek"}:
             print(f"[TokenizerRegistry] user tokenizer {model_name} ")
             n = cls._hf_count_tokens(text, family, model_name)
             if n is not None:
                 return n+1
 
-        # 3) Other families or failures -> estimate by character count.
+        # 3) 其他 / 都失败 → 退化为按字符数估算
         return len(text)
 
     @classmethod
     def warmup_tokenizers(cls, model_name: str):
         """
-        Preload the tokenizer for a model so later estimate_tokens calls avoid cold start.
-        Local directories warm up the local tokenizer with local_files_only semantics.
+        预加载某个模型对应的 tokenizer，使后续 estimate_tokens 不再触发冷启动。
+        本地目录：直接 warmup 本地 tokenizer，并强制 local_files_only。
         """
         model_name = cls._resolve_tokenizer_source(model_name)
 
-        # Warm up local directories first.
+        # 本地目录优先 warmup
         if cls._is_local_model_dir(model_name):
             cls._get_hf_tokenizer(model_name)
             return
@@ -269,10 +269,10 @@ class TokenizerRegistry:
                 cls._get_hf_tokenizer(hf_name)
 
 
-# Expose a top-level helper for convenience.
+# 为了用起来更方便，暴露一个顶层函数
 def estimate_tokens(text: str, model_name: str) -> int:
     """
-    Estimate the token count for text under the specified model.
+    统一入口：估计某模型下文本的 token 数。
     """
     return TokenizerRegistry.estimate_tokens(text, model_name)
 

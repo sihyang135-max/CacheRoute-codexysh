@@ -1,7 +1,7 @@
 """
-The current heartbeat loop is:
+现在 heartbeat loop 是：
     await client.heartbeat(proxy_id=PROXY_ID)
-After pool-level resource statistics are added here later, only extend it to:
+后续池级资源统计到这来后，只需扩展成：
     snap = metrics.snapshot()
     await client.heartbeat(
         proxy_id=PROXY_ID,
@@ -17,6 +17,6 @@ class ProxyMetrics:
         return {
             "inflight": ...,
             "qps_1m": ...,
-            # add gpu_util later
+            # gpu_util 以后加
         }
 
