@@ -60,6 +60,11 @@ kv_injector = load_module(
     "_kv_injector_under_test",
     ROOT / "kdn_server" / "kv_injector.py",
 )
+prometheus_cache = load_module(
+    "_prometheus_cache_under_test",
+    ROOT / "proxy" / "metrics" / "prometheus_cache.py",
+)
+PrometheusCache = prometheus_cache.PrometheusCache
 
 
 @dataclass
@@ -197,6 +202,15 @@ class KVResidencyTest(unittest.TestCase):
             self.assertEqual(warm.existing, 1)
             self.assertEqual(warm.payload_bytes, 0)
             self.assertTrue(warm.cache_hit)
+
+
+class PrometheusMetricTest(unittest.TestCase):
+    def test_current_vllm_kv_cache_metric_is_parsed(self) -> None:
+        metrics = (
+            '# HELP vllm:kv_cache_usage_perc KV-cache usage.\n'
+            'vllm:kv_cache_usage_perc{engine="0",model_name="model"} 0.25\n'
+        )
+        self.assertEqual(PrometheusCache._metric_value(metrics), 0.25)
 
 
 class StreamObservationTest(unittest.TestCase):

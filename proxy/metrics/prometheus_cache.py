@@ -23,6 +23,8 @@ class PrometheusCache:
     """Parses the KV cache utilization gauge across common vLLM metric spellings."""
 
     _KV_NAMES = (
+        "vllm:kv_cache_usage_perc",
+        "vllm_kv_cache_usage_perc",
         "vllm:gpu_cache_usage_perc",
         "vllm_gpu_cache_usage_perc",
         "vllm_gpu_kv_cache_usage_perc",
@@ -61,4 +63,3 @@ class PrometheusCache:
 
     def get(self, instance_id: str) -> Optional[InstanceMetricsSnapshot]:
         return self._items.get(instance_id)
-

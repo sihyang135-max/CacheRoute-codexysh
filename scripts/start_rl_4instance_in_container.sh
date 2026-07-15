@@ -81,6 +81,7 @@ export LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:-/workspace/llm-stack/config/l
 export SCHEDULER_MODEL_PATH="$MODEL_DIR"
 export SCHEDULER_MODEL_NAME="$MODEL_NAME"
 export SCHEDULER_TOKENIZER_PATH="$MODEL_DIR"
+export SCHEDULER_EMBEDDING_MODEL="${SCHEDULER_EMBEDDING_MODEL:-/workspace/llm-stack/models/intfloat/multilingual-e5-large-instruct}"
 
 LOG_DIR="$PROJECT/log/rl4"
 mkdir -p "$LOG_DIR"
@@ -141,7 +142,7 @@ done
 
 for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
   wait_http "http://127.0.0.1:$((18000 + idx))/v1/models" "vLLM-${idx}" 300
-  if ! curl -s "http://127.0.0.1:$((18000 + idx))/metrics" | grep -Eq 'gpu.*cache.*usage|gpu_cache_usage'; then
+  if ! curl -s "http://127.0.0.1:$((18000 + idx))/metrics" | grep -Eq 'kv_cache_usage|gpu_cache_usage'; then
     echo "[WARN] vLLM-${idx}: KVCache Prometheus metric was not found" | tee -a "$LOG_DIR/status.txt"
   fi
 done

@@ -42,6 +42,7 @@ docker exec -e MODEL_DIR="$MODEL_DIR" -e MODEL_NAME="$MODEL_NAME" \
   -e PROXY_RL_WARMUP_REQUESTS="${PROXY_RL_WARMUP_REQUESTS:-30}" \
   -e PROXY_RL_REWARD_TTFT_SCALE_MS="${PROXY_RL_REWARD_TTFT_SCALE_MS:-1000.0}" \
   -e PROXY_RL_REWARD_CLIP="${PROXY_RL_REWARD_CLIP:-5.0}" \
+  -e SCHEDULER_EMBEDDING_MODEL="${SCHEDULER_EMBEDDING_MODEL:-/workspace/llm-stack/models/intfloat/multilingual-e5-large-instruct}" \
   -e LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:-/workspace/llm-stack/config/lmcache_with_redis.yaml}" \
   "$CONTAINER" bash "$PROJECT_IN_CONTAINER/scripts/start_rl_4instance_in_container.sh"
 
