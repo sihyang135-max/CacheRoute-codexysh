@@ -196,22 +196,6 @@ def main():
                 "recreated_from_existing": recreated_from_existing,
             })
 
-            print(
-                f"[{i}] kv ok: kid={out['kid']} "
-                f"dumped_keys={out.get('dumped_keys')} kv_dir={out.get('kv_dir')}"
-            )
-
-            results.append({
-                "index": i,
-                "file": item["file"],
-                "kid": out["kid"],
-                "register_status": status,
-                "length": length,
-                "dumped_keys": out.get("dumped_keys"),
-                "kv_dir": out.get("kv_dir"),
-                "ok": True,
-            })
-
         except Exception as e:
             print(f"[{i}] error: {e}")
             results.append({
