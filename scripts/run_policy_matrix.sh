@@ -84,7 +84,10 @@ run_client() {
   local seed="$3"
   local output="$4"
 
-  docker exec "$CONTAINER" python3 "$PROJECT_IN_CONTAINER/client/perf_client.py" \
+  docker exec \
+    -e PYTHONPATH="$PROJECT_IN_CONTAINER" \
+    -w "$PROJECT_IN_CONTAINER" \
+    "$CONTAINER" python3 "$PROJECT_IN_CONTAINER/client/perf_client.py" \
     --mode concurrent \
     --base-url "$BASE_URL" \
     --workload-file "$WORKLOAD_FILE" \
