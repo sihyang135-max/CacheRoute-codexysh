@@ -78,6 +78,11 @@ def summarize(path: Path, discard_first: int) -> Dict[str, Any]:
             excluded[str(reason)] += 1
 
     kv_acks = [row.get("kv_ack") or {} for row in rows]
+    resident_hit_requests = sum(
+        int(ack.get("resident_hit_count") or 0) > 0
+        or bool(ack.get("resident_hit_kids"))
+        for ack in kv_acks
+    )
     total_tokens = sum(completion_tokens)
     return {
         "file": str(path),
@@ -100,6 +105,10 @@ def summarize(path: Path, discard_first: int) -> Dict[str, Any]:
         "applied_strategies": dict(sorted(applied.items())),
         "linucb_exclusion_reasons": dict(sorted(excluded.items())),
         "kv_ack_ok_requests": sum(ack.get("ok") is True for ack in kv_acks),
+        "kv_resident_hit_requests": resident_hit_requests,
+        "kv_resident_hit_count_total": sum(
+            int(ack.get("resident_hit_count") or 0) for ack in kv_acks
+        ),
         "kv_transfer_requests": sum(
             int(ack.get("payload_bytes") or 0) > 0 or int(ack.get("keys_injected") or 0) > 0
             for ack in kv_acks

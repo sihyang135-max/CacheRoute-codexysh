@@ -1,4 +1,4 @@
-"""Low-overhead shared-parameter LinUCB for Proxy -> Instance routing."""
+"""Low-overhead disjoint LinUCB for Proxy -> Instance routing."""
 from __future__ import annotations
 
 import math
@@ -31,7 +31,7 @@ def ttft_reward(ttft_ms: float, scale_ms: float, clip: float) -> float:
 
 
 class LinUCBStrategy(BaseInstanceStrategy):
-    """One shared linear model, safe for a dynamically changing instance pool."""
+    """Maintain one linear model per instance arm."""
 
     name = "linucb"
 
@@ -43,11 +43,12 @@ class LinUCBStrategy(BaseInstanceStrategy):
     ) -> None:
         self.alpha = max(0.0, float(alpha))
         self.ridge = max(1e-6, float(ridge))
+        # Total warm-up budget. Selection keeps arm update counts balanced.
         self.warmup_requests = max(0, int(warmup_requests))
         self._dim = 7  # bias + six documented state features
-        self._A = np.eye(self._dim, dtype=float) * self.ridge
-        self._b = np.zeros(self._dim, dtype=float)
+        self._arms: Dict[str, Dict[str, Any]] = {}
         self._effective_updates = 0
+        self._tie_cursor = 0
         self._lock = threading.Lock()
 
     @staticmethod
@@ -65,6 +66,17 @@ class LinUCBStrategy(BaseInstanceStrategy):
         ]
         return np.asarray([min(4.0, max(-4.0, v)) for v in vals], dtype=float)
 
+    def _arm(self, instance_id: str) -> Dict[str, Any]:
+        arm = self._arms.get(instance_id)
+        if arm is None:
+            arm = {
+                "A": np.eye(self._dim, dtype=float) * self.ridge,
+                "b": np.zeros(self._dim, dtype=float),
+                "updates": 0,
+            }
+            self._arms[instance_id] = arm
+        return arm
+
     def choose(self, instances: Sequence[InstanceLike], contexts: Dict[str, Dict[str, Any]]) -> Decision:
         if not instances:
             raise RuntimeError("no instances")
@@ -74,13 +86,36 @@ class LinUCBStrategy(BaseInstanceStrategy):
             raise RuntimeError("no valid LinUCB contexts")
 
         with self._lock:
+            for item, _ in rows:
+                self._arm(item.instance_id)
             candidate_features = {
                 it.instance_id: self._vector(row).tolist()
                 for it, row in rows
             }
             if self._effective_updates < self.warmup_requests:
-                # Deterministic Least-InFlight-like cold start using local queue state.
-                it, row = min(rows, key=lambda pair: (float(pair[1].get("prefill_raw", 0)) + float(pair[1].get("decode_raw", 0)), pair[0].instance_id))
+                minimum_updates = min(
+                    int(self._arm(item.instance_id)["updates"])
+                    for item, _ in rows
+                )
+                least_trained = [
+                    pair
+                    for pair in rows
+                    if int(self._arm(pair[0].instance_id)["updates"])
+                    == minimum_updates
+                ]
+                loads = [
+                    float(row.get("prefill_raw", 0))
+                    + float(row.get("decode_raw", 0))
+                    for _, row in least_trained
+                ]
+                minimum_load = min(loads)
+                tied = [
+                    pair
+                    for pair, load in zip(least_trained, loads)
+                    if load == minimum_load
+                ]
+                it, row = tied[self._tie_cursor % len(tied)]
+                self._tie_cursor += 1
                 return Decision(
                     instance_id=it.instance_id,
                     features=candidate_features[it.instance_id],
@@ -91,16 +126,19 @@ class LinUCBStrategy(BaseInstanceStrategy):
                     candidate_features=candidate_features,
                 )
 
-            theta = np.linalg.solve(self._A, self._b)
-            inv_A = np.linalg.inv(self._A)
-            best: Optional[Decision] = None
+            candidates: List[Decision] = []
             candidate_scores: Dict[str, float] = {}
             for it, row in rows:
+                arm = self._arm(it.instance_id)
+                A = arm["A"]
+                b = arm["b"]
+                theta = np.linalg.solve(A, b)
+                inv_A = np.linalg.inv(A)
                 x = self._vector(row)
                 bonus = self.alpha * math.sqrt(max(0.0, float(x @ inv_A @ x)))
                 score = float(theta @ x) + bonus
                 candidate_scores[it.instance_id] = score
-                candidate = Decision(
+                candidates.append(Decision(
                     instance_id=it.instance_id,
                     features=x.tolist(),
                     score=score,
@@ -108,10 +146,15 @@ class LinUCBStrategy(BaseInstanceStrategy):
                     effective_updates=self._effective_updates,
                     candidate_scores={},
                     candidate_features=candidate_features,
-                )
-                if best is None or candidate.score > best.score or (candidate.score == best.score and candidate.instance_id < best.instance_id):
-                    best = candidate
-            assert best is not None
+                ))
+            maximum = max(candidate.score for candidate in candidates)
+            tied = [
+                candidate
+                for candidate in candidates
+                if math.isclose(candidate.score, maximum, abs_tol=1e-12)
+            ]
+            best = tied[self._tie_cursor % len(tied)]
+            self._tie_cursor += 1
             return Decision(
                 instance_id=best.instance_id,
                 features=best.features,
@@ -127,16 +170,26 @@ class LinUCBStrategy(BaseInstanceStrategy):
         chosen = self.choose(instances, contexts)
         return next(it for it in instances if it.instance_id == chosen.instance_id)
 
-    def update(self, features: Sequence[float], reward: float) -> None:
+    def update(self, instance_id: str, features: Sequence[float], reward: float) -> None:
         x = np.asarray(features, dtype=float)
         if x.shape != (self._dim,) or not np.all(np.isfinite(x)) or not math.isfinite(float(reward)):
             return
         with self._lock:
-            self._A += np.outer(x, x)
-            self._b += x * float(reward)
+            arm = self._arm(str(instance_id))
+            arm["A"] += np.outer(x, x)
+            arm["b"] += x * float(reward)
+            arm["updates"] = int(arm["updates"]) + 1
             self._effective_updates += 1
 
     @property
     def effective_updates(self) -> int:
         with self._lock:
             return self._effective_updates
+
+    @property
+    def arm_updates(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                instance_id: int(arm["updates"])
+                for instance_id, arm in self._arms.items()
+            }

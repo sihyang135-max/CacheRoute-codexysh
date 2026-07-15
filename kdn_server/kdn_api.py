@@ -839,6 +839,7 @@ async def inject_ready_kv(payload: Dict[str, Any]):
     row_map = {str(it.id): it for it in items}
 
     injected_kids: List[str] = []
+    resident_hit_kids: List[str] = []
     text_only_kids: List[str] = []
     miss_kids: List[str] = list(miss or [])
     total_keys = 0
@@ -875,6 +876,18 @@ async def inject_ready_kv(payload: Dict[str, Any]):
         kv_dir = os.path.join(kv_root, kid)
 
         try:
+            all_present, existing_count, total_entries = injector.probe_kv_dir(kv_dir)
+            if all_present:
+                injected_kids.append(kid)
+                resident_hit_kids.append(kid)
+                logging.info(
+                    "[KDN] resident hit: kid=%s existing=%s total=%s payload_bytes=0",
+                    kid,
+                    existing_count,
+                    total_entries,
+                )
+                continue
+
             net_result = {
                 "batch_id": None,
                 "batch_size": 1,
@@ -931,6 +944,8 @@ async def inject_ready_kv(payload: Dict[str, Any]):
 
             # 只有真正注入完成 + 网络模拟完成后才记 success
             injected_kids.append(kid)
+            if res.cache_hit:
+                resident_hit_kids.append(kid)
             total_keys += int(res.injected)
             total_payload_bytes += int(res.payload_bytes)
             total_payload_files += int(res.payload_files)
@@ -970,6 +985,8 @@ async def inject_ready_kv(payload: Dict[str, Any]):
         content={
             "ok": True,
             "injected_kids": injected_kids,
+            "resident_hit_kids": resident_hit_kids,
+            "resident_hit_count": len(resident_hit_kids),
             "text_only_kids": text_only_kids,
             "miss_kids": miss_kids,
             "keys_injected": total_keys,

@@ -8,6 +8,8 @@ set -euo pipefail
 
 INSTANCE_COUNT="${INSTANCE_COUNT:-4}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
+INSTANCE_GPU_GROUPS="${INSTANCE_GPU_GROUPS:-}"
+INSTANCE_TP_SIZES="${INSTANCE_TP_SIZES:-}"
 PROXY_INSTANCE_STRATEGY="${PROXY_INSTANCE_STRATEGY:-linucb}"
 PROXY_RL_ENABLED="${PROXY_RL_ENABLED:-1}"
 PROXY_RL_ALPHA="${PROXY_RL_ALPHA:-0.4}"
@@ -31,6 +33,46 @@ case "${PREWARM_COUNT:-0}" in
   ''|*[!0-9]*) echo "[FAIL] PREWARM_COUNT must be 0, 'all', or a positive integer"; exit 2 ;;
 esac
 
+declare -a gpu_groups=()
+declare -a tp_sizes=()
+declare -A used_gpus=()
+if [ -n "$INSTANCE_GPU_GROUPS" ] || [ -n "$INSTANCE_TP_SIZES" ]; then
+  if [ -z "$INSTANCE_GPU_GROUPS" ] || [ -z "$INSTANCE_TP_SIZES" ]; then
+    echo "[FAIL] INSTANCE_GPU_GROUPS and INSTANCE_TP_SIZES must be set together"
+    exit 2
+  fi
+  IFS=';' read -r -a gpu_groups <<< "$INSTANCE_GPU_GROUPS"
+  IFS=',' read -r -a tp_sizes <<< "$INSTANCE_TP_SIZES"
+  if [ "${#gpu_groups[@]}" -ne "$INSTANCE_COUNT" ] || [ "${#tp_sizes[@]}" -ne "$INSTANCE_COUNT" ]; then
+    echo "[FAIL] custom GPU/TP topology must contain INSTANCE_COUNT entries"
+    exit 2
+  fi
+  for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
+    case "${tp_sizes[$idx]}" in
+      ''|*[!0-9]*) echo "[FAIL] invalid TP size: ${tp_sizes[$idx]}"; exit 2 ;;
+    esac
+    if [ "${tp_sizes[$idx]}" -lt 1 ] || [ -z "${gpu_groups[$idx]}" ]; then
+      echo "[FAIL] GPU group and TP size must be non-empty and positive"
+      exit 2
+    fi
+    IFS=',' read -r -a group_gpu_ids <<< "${gpu_groups[$idx]}"
+    if [ "${#group_gpu_ids[@]}" -ne "${tp_sizes[$idx]}" ]; then
+      echo "[FAIL] instance $idx has ${#group_gpu_ids[@]} GPUs but TP=${tp_sizes[$idx]}"
+      exit 2
+    fi
+    for gpu_id in "${group_gpu_ids[@]}"; do
+      case "$gpu_id" in
+        ''|*[!0-9]*) echo "[FAIL] invalid GPU id: $gpu_id"; exit 2 ;;
+      esac
+      if [ -n "${used_gpus[$gpu_id]:-}" ]; then
+        echo "[FAIL] GPU $gpu_id is assigned to more than one instance"
+        exit 2
+      fi
+      used_gpus[$gpu_id]=1
+    done
+  done
+fi
+
 export PYTHONPATH="$PROJECT"
 export PYTHONHASHSEED=0
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
@@ -49,6 +91,7 @@ stop_old() {
   pkill -f 'demo_proxy.py' || true
   pkill -f 'demo_kdn.py' || true
   pkill -f 'demo_scheduler.py' || true
+  pkill -f 'demo_scheduler_rl.py' || true
   sleep 2
 }
 
@@ -73,18 +116,24 @@ start_bg() {
 stop_old
 : > "$LOG_DIR/status.txt"
 
-# Defaults preserve the original four TP=2 layout. Set TENSOR_PARALLEL_SIZE=1
-# for four single-GPU instances.
+# Default uses equal TP sizes. For TP4/TP2/TP1/TP1, set
+# INSTANCE_GPU_GROUPS='0,1,2,3;4,5;6;7' and INSTANCE_TP_SIZES='4,2,1,1'.
 for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
-  gpu_start=$((idx * TENSOR_PARALLEL_SIZE))
-  gpu_end=$((gpu_start + TENSOR_PARALLEL_SIZE - 1))
-  gpu_ids="$(seq -s, "$gpu_start" "$gpu_end")"
+  if [ "${#gpu_groups[@]}" -gt 0 ]; then
+    gpu_ids="${gpu_groups[$idx]}"
+    tp_size="${tp_sizes[$idx]}"
+  else
+    gpu_start=$((idx * TENSOR_PARALLEL_SIZE))
+    gpu_end=$((gpu_start + TENSOR_PARALLEL_SIZE - 1))
+    gpu_ids="$(seq -s, "$gpu_start" "$gpu_end")"
+    tp_size="$TENSOR_PARALLEL_SIZE"
+  fi
   vllm_port=$((18000 + idx))
   CUDA_VISIBLE_DEVICES="$gpu_ids" start_bg "$LOG_DIR/vllm-${idx}.log" \
     python3 -m vllm.entrypoints.openai.api_server \
       --model "$MODEL_DIR" --served-model-name "$MODEL_NAME" \
       --host 127.0.0.1 --port "$vllm_port" \
-      --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" --gpu-memory-utilization 0.82 \
+      --tensor-parallel-size "$tp_size" --gpu-memory-utilization 0.82 \
       --max-model-len 4096 --max-num-seqs 8 --max-num-batched-tokens 8192 \
       --kv-offloading-backend lmcache --kv-offloading-size 32 \
       --disable-hybrid-kv-cache-manager --kv-cache-metrics
@@ -137,7 +186,7 @@ if [ "$registered_count" -ne "$INSTANCE_COUNT" ]; then
   exit 1
 fi
 echo "[OK] $INSTANCE_COUNT Instances registered" | tee -a "$LOG_DIR/status.txt"
-echo "[CONFIG] strategy=$PROXY_INSTANCE_STRATEGY rl_enabled=$PROXY_RL_ENABLED alpha=$PROXY_RL_ALPHA lambda=$PROXY_RL_LAMBDA warmup=$PROXY_RL_WARMUP_REQUESTS reward_scale_ms=$PROXY_RL_REWARD_TTFT_SCALE_MS reward_clip=$PROXY_RL_REWARD_CLIP tp=$TENSOR_PARALLEL_SIZE" | tee -a "$LOG_DIR/status.txt"
+echo "[CONFIG] strategy=$PROXY_INSTANCE_STRATEGY rl_enabled=$PROXY_RL_ENABLED alpha=$PROXY_RL_ALPHA lambda=$PROXY_RL_LAMBDA warmup=$PROXY_RL_WARMUP_REQUESTS reward_scale_ms=$PROXY_RL_REWARD_TTFT_SCALE_MS reward_clip=$PROXY_RL_REWARD_CLIP tp_default=$TENSOR_PARALLEL_SIZE gpu_groups=${INSTANCE_GPU_GROUPS:-auto} tp_sizes=${INSTANCE_TP_SIZES:-auto}" | tee -a "$LOG_DIR/status.txt"
 
 # Optional, deliberately explicit: KV building may take a long time.
 if [ "${PREWARM_COUNT:-0}" != "0" ]; then

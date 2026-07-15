@@ -1,124 +1,154 @@
 # LinUCB 二级调度实验协议
 
-## 1. 当前判断
+## 1. 当前结论边界
 
 旧实验只能证明 LinUCB 更新和共享 Redis KV 复用曾经发生，不能证明 LinUCB 优于基线：
 
-- 4 个实例共享同一个 Redis，预热后运行时 `payload_bytes=0`，实际没有实例间 KV 传输差异。
-- 4 个实例位于同一台机器并使用回环链路，网络特征近似常量。
-- 旧配置只预热 1 个知识块，99 个问题没有形成完整知识工作集。
-- 旧 reward 使用本机默认 `15000 ms` SLO 归一化，300 ms 与 900 ms 的 reward 仅差 0.04，低于探索项量级。
-- 旧 TTFT 可能把 role-only SSE 块当成首 token；吞吐量包含失败请求。
-- Least Inflight 读取的心跳 `inflight` 可能为 null，基线会退化成固定选择第一个实例。
+- 四个实例共享同一个 Redis。预热后 `keys_injected=0`、`payload_bytes=0` 通常表示 KV 已驻留，不表示 KV 路径未启用。
+- 共享 Redis 没有实例级知识位置差异，不能用于证明“知识感知放置/路由”的优势。
+- 旧 reward 被 15000 ms 客户端 SLO 过度缩小，探索项远大于 reward 差异。
+- 旧 TTFT 可能把 role-only SSE 块当作首 token；旧吞吐统计也可能包含失败请求。
+- 旧 Least-Inflight 依赖可能为空的心跳 `inflight`，平局时会固定选择第一个实例。
+- 单一问题、固定顺序和不配对种子不足以证明上下文在线学习有效。
 
-因此先做正确性门禁，再做环境、状态和参数消融。任何门禁失败时不得进入论文性能表。
+本阶段先验证一个更窄、但可严谨支撑的命题：**在异构计算能力和动态队列共同存在时，Disjoint LinUCB 能否在线学习请求上下文与实例状态的匹配关系，并改善平均 TTFT 或系统吞吐。**
 
-## 2. 三端一致性门禁
+实例级知识驻留是下一阶段命题，必须使用独立 Redis/KV 域后再验证。
 
-正式实验只使用 Git 提交态，禁止直接在服务器上修改后继续跑实验。
+## 2. 源码与环境门禁
+
+正式实验只使用可定位的 Git 提交。禁止直接修改服务器后继续产出论文数据。
 
 ```bash
 cd /llm-stack/cr0624
-EXPECTED_COMMIT=<local_commit> bash scripts/verify_source_sync.sh
+EXPECTED_COMMIT=<git_commit> bash scripts/verify_source_sync.sh
 ```
 
-必须记录：Git commit、源码 SHA-256、Docker image ID、模型目录、GPU 型号、驱动、CUDA、PyTorch、vLLM、LMCache、Redis 配置和完整启动环境变量。
+每次实验必须保存：
 
-## 3. 正确性冒烟测试
+- Git commit 和 `env/experiment_source.sha256` 校验结果；
+- Docker image ID、模型路径和模型哈希；
+- GPU 型号、驱动、CUDA、PyTorch、vLLM、LMCache 与 Redis 配置；
+- 完整启动参数、矩阵配置和 `run-order.tsv`；
+- 每个请求的原始 JSONL，不只保存聚合结果。
 
-启动参数至少显式指定：
+任何门禁失败都不得进入论文性能表。
+
+## 3. 已实现的正确性修复
+
+- 使用 Disjoint LinUCB，每个实例维护独立的 `A`、`b` 和更新计数。
+- warmup 按实例已完成更新数均衡分配，避免固定实例冷启动偏置。
+- 从选路到请求完成维护本地 route reservation，并纳入 Least-Inflight 和 LinUCB 队列状态。
+- KDN 独占物理传输排队；Proxy 不再重复模拟同一传输等待。
+- KV 注入使用 `SET NX`，区分 cold injection 与 resident hit。
+- TTFT 只在首个 content/reasoning token 到达时记录，不计 role-only 块。
+- reward 为缩放并裁剪的直接 TTFT：`-min(TTFT / scale_ms, clip)`。
+- 所有候选实例的特征、分数、排除原因、选择阶段和实例级更新数写入 trace。
+
+## 4. 正确性冒烟测试
+
+在正式矩阵前，先用完整 NQ workload 运行至少 120 个请求。必须满足：
+
+- `success_rate=1.0`；
+- `missing_meta_requests=0`、`trace_warning_requests=0`；
+- 每个成功请求都有真实 `client_ttft_ms`；
+- 四个实例均注册，控制端口与被选实例一致；
+- warmup 后出现 `selection_phase=linucb`；
+- `rl_updated_requests` 等于成功且可观测首 token 的请求数；
+- `kv_ack_ok_requests` 正常，且 resident hit 与实际传输分别统计；
+- 不发生未解释的 fallback 或持续缺失 Prometheus 状态。
+
+共享 Redis 热缓存场景允许 `kv_transfer_requests=0`，但必须同时看到 resident-hit 证据，并在论文中明确说明。
+
+## 5. 第一阶段：异构计算与动态队列
+
+建议拓扑为 TP4/TP2/TP1/TP1：
 
 ```bash
-INSTANCE_COUNT=4
-TENSOR_PARALLEL_SIZE=1
-PREWARM_COUNT=all
-PROXY_INSTANCE_STRATEGY=linucb
-PROXY_RL_ENABLED=1
-PROXY_RL_ALPHA=0.4
-PROXY_RL_LAMBDA=1.0
-PROXY_RL_WARMUP_REQUESTS=30
-PROXY_RL_REWARD_TTFT_SCALE_MS=1000
-PROXY_RL_REWARD_CLIP=5
+export INSTANCE_COUNT=4
+export INSTANCE_GPU_GROUPS='0,1,2,3;4,5;6;7'
+export INSTANCE_TP_SIZES='4,2,1,1'
 ```
 
-容器内发送 120 个低速请求：
+正式比较 `round_robin`、修正后的 `least_inflight` 和 `linucb`。默认参数先固定为：
 
 ```bash
-cd /workspace/llm-stack/CacheRoute
-PYTHONPATH=. python3 client/perf_client.py \
-  --mode rps --rps 0.5 --requests 120 --allow-duplicate --seed 20260715 \
-  --base-url http://127.0.0.1:7001 \
-  --workload-file client/taskset/workload_nq.json \
-  --model deepseek-r1-distill-qwen-7b \
-  --stream true --rag true --injection-type kvcache --max-tokens 64 \
-  --monitor-gpu --gpu-ids 0,1,2,3 \
-  --output-jsonl log/experiments/smoke-linucb.jsonl
+export LINUCB_ALPHA=0.05
+export LINUCB_LAMBDA=1.0
+export WARMUP_REQUESTS=200
+export REWARD_SCALE_MS=1000
+export REWARD_CLIP=5
 ```
 
-通过标准：
-
-- 成功率 100%，`missing_meta_requests=0`，`trace_warning_requests=0`。
-- 120 个请求均有真实 `client_ttft_ms`、选中实例和控制端口。
-- 前 30 个有效更新为 warmup，之后存在 `selection_phase=linucb`。
-- `rl_updated_requests=120`，候选分数和特征完整，不发生静默 fallback。
-- 四个实例均被注册且请求分布不是由空负载字段导致的固定首实例。
-- LMCache 日志能确认 store/retrieve；共享 Redis 场景允许运行时传输字节为 0，但必须在结果中明确标注。
-
-汇总命令：
+运行矩阵：
 
 ```bash
-python3 scripts/analyze_experiment_jsonl.py \
-  log/experiments/smoke-linucb.jsonl --discard-first 30
+cd /llm-stack/cr0624
+PROJECT_HOST=/llm-stack/cr0624 \
+MODEL_DIR=<model_dir> \
+MODEL_NAME=deepseek-r1-distill-qwen-7b \
+CONTAINER=cr0624-rl \
+REDIS_CONTAINER=lmcache-redis \
+INSTANCE_GPU_GROUPS='0,1,2,3;4,5;6;7' \
+INSTANCE_TP_SIZES='4,2,1,1' \
+CONCURRENCIES=1,4,8,16 \
+REPEATS=3 REQUESTS=100 WARMUP_REQUESTS=200 \
+bash scripts/run_policy_matrix.sh
 ```
 
-## 4. 第一阶段：同构共享缓存基线
+矩阵脚本对每个策略单独重启服务栈并执行显式 warmup；同一并发度和重复轮次使用配对种子，策略执行顺序轮换。共享 Redis 只在矩阵开始前统一预热，不能让某个策略单独改变测量条件。
 
-目的不是预设 LinUCB 获胜，而是验证在只有动态队列变化时是否不劣于合理基线。
+先用并发度或 RPS 扫描找出低载、中载和接近饱和三个区域。论文主表至少使用 5 个独立重复；3 次只用于初步诊断。
 
-策略包括 `round_robin`、修正后的 `least_inflight` 和 `linucb`。先用 RPS 梯度寻找饱和点，例如 0.5、1、2、4 req/s；每点 300 个请求。正式比较选择低载、中载和接近饱和三个点，每个策略、负载点运行至少 5 个独立重复，种子和运行顺序配对并随机化。
+## 6. 指标与统计
 
 主指标：
 
-- 成功请求的 mean client TTFT。
-- 成功请求吞吐量 req/s。
-- 输出 token 吞吐量 token/s。
-- 成功率。
+- 成功请求的 mean client TTFT；
+- successful req/s；
+- output token/s；
+- success rate。
 
-辅助指标为 median/P95 TTFT、实例负载分布和 GPU 利用率。LinUCB 与所有基线均丢弃相同数量的前 30 个请求后报告稳态结果，同时单独报告包含 warmup 的端到端结果。
+辅助指标：median/P95 TTFT、wall time、实例选择分布、GPU 利用率、fallback、KV resident hit/transfer 和 LinUCB 更新轨迹。P99 不作为本阶段优越性的主要证据。
 
-## 5. 第二阶段：知识密集型异构环境
+每个负载点报告重复实验的均值、标准差和 95% 置信区间。策略比较使用同一 workload、同一随机种子和同一缓存初始状态。调参种子与最终报告种子必须分离。
 
-共享 Redis 环境不能支撑“知识感知调度优越性”的论文结论。下一阶段必须建立每实例独立 KV 存储或独立 Redis 端口，使一次知识传输只温热被选实例，并让不同实例到 KDN 的带宽/排队差异真实作用于请求 TTFT。
+LinUCB warmup 是算法成本的一部分：
 
-在该环境中依次做：
+- 主稳态表报告完成固定 warmup 后的测量阶段；
+- 另表报告包含 warmup 的端到端结果和达到稳定收益所需请求数。
 
-1. 热点偏斜：均匀、Zipf 轻偏斜、Zipf 重偏斜。
-2. 知识块大小：短、中、长分桶及混合分布。
-3. 计算负载：稳定低载、稳定高载、突发负载和相位切换。
-4. 网络条件：同构、稳定异构、带宽突降和恢复。
-5. 缓存容量：充足与受限，观察迁移、命中和淘汰。
+## 7. 参数与状态消融
 
-若算法状态中没有“知识在各实例的驻留/命中可能性”，则 LinUCB 无法利用独立缓存带来的主要差异。该项应作为代码检查和状态消融的重点，不能只通过调整 alpha 解决。
+固定中载和异构拓扑后，每次只改变一个因素：
 
-## 6. 参数与状态消融
+- `alpha`: 0、0.02、0.05、0.1、0.2；
+- `lambda`: 0.1、1、10；
+- warmup: 0、40、100、200；
+- reward scale: 500、1000、2000 ms；
+- 状态组：仅队列；队列+请求长度；队列+GPU KV 使用率；完整状态；
+- reward：直接 TTFT、裁剪 TTFT、TTFT 加失败惩罚。
 
-在固定中载和异构场景下依次改变单个因素：
+若 LinUCB 只在某个偶然参数上获胜，不能形成普适结论。应优先检查状态是否可观测、量纲是否平衡以及环境是否真的存在可学习差异。
 
-- `alpha`: 0、0.05、0.1、0.2、0.4。
-- `lambda`: 0.1、1、10。
-- warmup: 0、10、30、100。
-- reward scale: 500、1000、2000 ms。
-- 状态组：仅队列；队列+请求长度；队列+网络；队列+缓存驻留；全部状态。
-- reward：直接 TTFT、裁剪 TTFT，以及后续可能的 TTFT+失败惩罚。
+## 8. 第二阶段：实例级知识驻留
 
-调参数据与最终报告数据必须使用不同的运行种子；不能在测试集上选出最好参数后仍把同一批结果作为论文主表。
+共享 Redis 无法支撑“知识密集型任务调度”主张。该阶段需要：
 
-## 7. 进入论文阶段的判据
+- 每实例独立 KV 存储或独立 Redis namespace/端口；
+- 可观测的实例-知识驻留矩阵、命中概率与剩余容量；
+- 不同实例到 KDN 的真实或可控带宽与排队差异；
+- 热点偏斜、知识块长度、缓存容量和负载突发的组合 workload；
+- 路由后只温热被选实例，从而形成可验证的长期决策影响。
 
-只有同时满足以下条件，才开始写性能结论：
+状态中必须加入实例级知识命中/驻留特征。仅调 `alpha` 不能弥补状态缺失。
 
-- 三端源码和环境指纹可复现。
-- 真实 KV 路径、真实首 token 和成功吞吐均可审计。
-- LinUCB 在至少一个与论文背景一致的异构知识工作负载上，对强基线的 mean TTFT 或吞吐有稳定优势，并有置信区间。
-- 在同构或不适用场景中不夸大收益，明确算法适用边界。
-- 消融能解释收益来自哪些状态、reward 和在线适应机制，而不是偶然参数。
+## 9. 进入论文阶段的判据
+
+只有同时满足以下条件，才开始撰写性能结论：
+
+- 本地、Git、服务器源码和环境指纹一致且可复现；
+- 真实 KV 路径、真实首 token 和成功吞吐均可审计；
+- LinUCB 在至少一个与论文命题一致的异构 workload 上，对强基线的 mean TTFT 或吞吐有稳定优势和置信区间；
+- 在同构或不适用场景中不夸大收益，明确算法适用边界；
+- 消融能解释收益来自状态、reward 和在线适应，而不是运行顺序或偶然参数。

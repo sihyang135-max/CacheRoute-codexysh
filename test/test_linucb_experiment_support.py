@@ -6,6 +6,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
+import tempfile
 import time
 
 from util.openai_stream import OpenAIStreamObserver
@@ -52,6 +53,14 @@ least_inflight = load_module(
 LeastInflightStrategy = least_inflight.LeastInflightStrategy
 ProxyTask = load_module("_proxy_task_under_test", ROOT / "proxy" / "queue" / "task.py").ProxyTask
 
+redis_stub = ModuleType("redis")
+redis_stub.Redis = object
+sys.modules.setdefault("redis", redis_stub)
+kv_injector = load_module(
+    "_kv_injector_under_test",
+    ROOT / "kdn_server" / "kv_injector.py",
+)
+
 
 @dataclass
 class FakeInstance:
@@ -91,11 +100,36 @@ class LinUCBObservabilityTest(unittest.TestCase):
         self.assertEqual(warmup.effective_updates, 0)
         self.assertEqual(set(warmup.candidate_features), {"inst-0", "inst-1"})
 
-        strategy.update(warmup.features, reward=-0.5)
+        strategy.update(warmup.instance_id, warmup.features, reward=-0.5)
         decision = strategy.choose(instances, contexts)
         self.assertEqual(decision.phase, "linucb")
         self.assertEqual(decision.effective_updates, 1)
         self.assertEqual(set(decision.candidate_scores), {"inst-0", "inst-1"})
+
+    def test_warmup_balances_updates_across_arms(self) -> None:
+        instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
+        contexts = {"inst-0": context(0), "inst-1": context(0)}
+        strategy = LinUCBStrategy(alpha=0.1, ridge=1.0, warmup_requests=4)
+
+        for _ in range(4):
+            decision = strategy.choose(instances, contexts)
+            strategy.update(decision.instance_id, decision.features, reward=-0.5)
+
+        self.assertEqual(strategy.arm_updates, {"inst-0": 2, "inst-1": 2})
+
+    def test_disjoint_models_learn_instance_specific_reward(self) -> None:
+        instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
+        contexts = {"inst-0": context(0), "inst-1": context(0)}
+        strategy = LinUCBStrategy(alpha=0.0, ridge=1.0, warmup_requests=0)
+        features = strategy.choose(instances, contexts).features
+
+        strategy.update("inst-0", features, reward=-1.0)
+        strategy.update("inst-1", features, reward=-0.1)
+
+        self.assertEqual(
+            strategy.choose(instances, contexts).instance_id,
+            "inst-1",
+        )
 
     def test_least_inflight_prefers_proxy_local_load_snapshot(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
@@ -104,6 +138,65 @@ class LinUCBObservabilityTest(unittest.TestCase):
             hint={"instance_inflight": {"inst-0": 3, "inst-1": 0}},
         )
         self.assertEqual(chosen.instance_id, "inst-1")
+
+    def test_least_inflight_rotates_equal_load_ties(self) -> None:
+        instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
+        strategy = LeastInflightStrategy()
+        hint = {"inflight_by_instance": {"inst-0": 0, "inst-1": 0}}
+
+        self.assertEqual(strategy.select(instances, hint).instance_id, "inst-0")
+        self.assertEqual(strategy.select(instances, hint).instance_id, "inst-1")
+
+
+class KVResidencyTest(unittest.TestCase):
+    class FakePipeline:
+        def __init__(self, values: dict[bytes, bytes]) -> None:
+            self.values = values
+            self.keys: list[bytes] = []
+
+        def exists(self, key: bytes) -> None:
+            self.keys.append(key)
+
+        def execute(self) -> list[int]:
+            return [int(key in self.values) for key in self.keys]
+
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.values: dict[bytes, bytes] = {}
+
+        def pipeline(self, transaction: bool = False):
+            return KVResidencyTest.FakePipeline(self.values)
+
+        def set(self, key: bytes, value: bytes, nx: bool = False) -> bool:
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+    def test_cold_injection_then_resident_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "blocks").mkdir()
+            (root / "blocks" / "value.dump").write_bytes(b"payload")
+            (root / "manifest.jsonl").write_text(
+                '{"key_b64url":"azE","file":"blocks/value.dump"}\n',
+                encoding="utf-8",
+            )
+            injector = kv_injector.KVCacheInjector.__new__(
+                kv_injector.KVCacheInjector
+            )
+            injector.rds = self.FakeRedis()
+
+            cold = injector.inject_kv_dir(str(root))
+            warm = injector.inject_kv_dir(str(root))
+
+            self.assertEqual(cold.injected, 1)
+            self.assertEqual(cold.payload_bytes, len(b"payload"))
+            self.assertFalse(cold.cache_hit)
+            self.assertEqual(warm.injected, 0)
+            self.assertEqual(warm.existing, 1)
+            self.assertEqual(warm.payload_bytes, 0)
+            self.assertTrue(warm.cache_hit)
 
 
 class StreamObservationTest(unittest.TestCase):

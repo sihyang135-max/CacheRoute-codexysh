@@ -447,10 +447,11 @@ def _update_linucb_once(task: ProxyTask) -> None:
     task.trace["rl_reward_ttft_scale_ms"] = float(config.PROXY_RL_REWARD_TTFT_SCALE_MS)
     task.trace["rl_reward_clip"] = float(config.PROXY_RL_REWARD_CLIP)
     reward = _linucb_reward(task)
-    strategy.update(features, reward)
+    strategy.update(task.instance_id, features, reward)
     task.trace["rl_updated"] = 1
     task.trace["rl_reward_milli"] = int(reward * 1000)
     task.trace["rl_effective_updates_after"] = strategy.effective_updates
+    task.trace["rl_arm_updates_after"] = strategy.arm_updates
 
 
 async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) -> AsyncGenerator[bytes, None]:
@@ -514,53 +515,81 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
         selection_trace.update({"selection_phase": "failed", "selection_reason": "no_alive_instances"})
         return None, None, selection_trace
 
-    local_inflight_hint = {"instance_inflight": {}}
-    for item in instances:
-        snapshot = queue_mgr.get_instance_rl_snapshot(item.instance_id)
-        local_inflight_hint["instance_inflight"][item.instance_id] = (
-            int(snapshot["prefill_count"]) + int(snapshot["decode_count"])
+    def local_inflight_hint() -> Dict[str, Dict[str, int]]:
+        return {
+            "instance_inflight": {
+                item.instance_id: queue_mgr.get_route_reservation(item.instance_id)
+                for item in instances
+            }
+        }
+
+    def choose_and_reserve(
+        applied_strategy: Any,
+        phase: str,
+        reason: str,
+    ) -> Tuple[Any, None, Dict[str, Any]]:
+        hint = (
+            local_inflight_hint()
+            if getattr(applied_strategy, "name", "") == "least_inflight"
+            else req_obj
         )
+        chosen = applied_strategy.select(instances, hint=hint)
+        queue_mgr.reserve_route(chosen.instance_id)
+        selection_trace.update({
+            "applied_instance_strategy": str(
+                getattr(applied_strategy, "name", type(applied_strategy).__name__)
+            ),
+            "selection_phase": phase,
+            "selection_reason": reason,
+            "selected_instance_id": chosen.instance_id,
+            "route_reservation_after": queue_mgr.get_route_reservation(
+                chosen.instance_id
+            ),
+        })
+        return chosen, None, selection_trace
 
     try:
         if not config.PROXY_RL_ENABLED:
-            applied_strategy = strategy if not isinstance(strategy, LinUCBStrategy) else build_instance_strategy("least_inflight")
-            hint = local_inflight_hint if getattr(applied_strategy, "name", "") == "least_inflight" else req_obj
-            chosen = applied_strategy.select(instances, hint=hint)
-            selection_trace.update({
-                "applied_instance_strategy": str(getattr(applied_strategy, "name", type(applied_strategy).__name__)),
-                "selection_phase": "fallback" if isinstance(strategy, LinUCBStrategy) else "baseline",
-                "selection_reason": "linucb_disabled" if isinstance(strategy, LinUCBStrategy) else "configured_non_linucb_strategy",
-                "selected_instance_id": chosen.instance_id,
-            })
-            return chosen, None, selection_trace
+            applied_strategy = (
+                build_instance_strategy("least_inflight")
+                if isinstance(strategy, LinUCBStrategy)
+                else strategy
+            )
+            return choose_and_reserve(
+                applied_strategy,
+                "fallback" if isinstance(strategy, LinUCBStrategy) else "baseline",
+                "linucb_disabled"
+                if isinstance(strategy, LinUCBStrategy)
+                else "configured_non_linucb_strategy",
+            )
         if not isinstance(strategy, LinUCBStrategy):
-            hint = local_inflight_hint if getattr(strategy, "name", "") == "least_inflight" else req_obj
-            chosen = strategy.select(instances, hint=hint)
-            selection_trace.update({
-                "applied_instance_strategy": str(getattr(strategy, "name", type(strategy).__name__)),
-                "selection_phase": "baseline",
-                "selection_reason": "configured_non_linucb_strategy",
-                "selected_instance_id": chosen.instance_id,
-            })
-            return chosen, None, selection_trace
+            return choose_and_reserve(
+                strategy,
+                "baseline",
+                "configured_non_linucb_strategy",
+            )
 
         service = req_obj.Service
         prompt = req_obj.Prompt
-        if (not bool(getattr(prompt, "stream", False))) or str(getattr(service, "Injection_type", "")).lower() != "kvcache":
-            chosen = build_instance_strategy("least_inflight").select(instances, hint=local_inflight_hint)
-            selection_trace.update({
-                "applied_instance_strategy": "least_inflight",
-                "selection_phase": "fallback",
-                "selection_reason": "linucb_requires_streaming_kvcache",
-                "selected_instance_id": chosen.instance_id,
-            })
-            return chosen, None, selection_trace
+        injection_type = str(
+            getattr(service, "Injection_type", "") or ""
+        ).strip().lower()
+        if not bool(getattr(prompt, "stream", False)):
+            return choose_and_reserve(
+                build_instance_strategy("least_inflight"),
+                "fallback",
+                "linucb_requires_streaming",
+            )
 
         cache: PrometheusCache = app.state.prometheus_cache  # type: ignore
         kdn_addr = str(getattr(req_obj.Task, "KDN_server_addr", "") or "")
         prompt_len = max(0, int(getattr(prompt, "token_length", 0) or 0))
         knowledge_len = max(0, int(getattr(service, "Knowledge_length", 0) or 0))
-        kv_len = (knowledge_len // 256) * 256
+        kv_len = (
+            (knowledge_len // 256) * 256
+            if injection_type == "kvcache"
+            else 0
+        )
         contexts: Dict[str, Dict[str, Any]] = {}
         safe_instances = []
         excluded_instances: Dict[str, str] = {}
@@ -603,24 +632,54 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
             "linucb_excluded_instances": excluded_instances,
         })
         if len(safe_instances) < 2:
-            chosen = build_instance_strategy("least_inflight").select(instances, hint=local_inflight_hint)
-            selection_trace.update({
-                "applied_instance_strategy": "least_inflight",
-                "selection_phase": "fallback",
-                "selection_reason": "insufficient_safe_linucb_candidates",
-                "selected_instance_id": chosen.instance_id,
-            })
-            return chosen, None, selection_trace
+            return choose_and_reserve(
+                build_instance_strategy("least_inflight"),
+                "fallback",
+                "insufficient_safe_linucb_candidates",
+            )
+
+        # Link lookup awaits can overlap concurrent selections. Refresh local
+        # state immediately before choosing, then reserve synchronously so the
+        # next request sees this assignment before it reaches a queue.
+        for item in safe_instances:
+            snapshot = queue_mgr.get_instance_rl_snapshot(item.instance_id)
+            decode_raw = int(snapshot["decode_count"])
+            visible_prefill = (
+                int(snapshot["prefill_count"])
+                + int(snapshot["prepare_queue_size"])
+                + int(snapshot["ready_queue_size"])
+            )
+            outstanding = queue_mgr.get_route_reservation(item.instance_id)
+            prefill_raw = max(
+                visible_prefill,
+                max(0, outstanding - decode_raw),
+            )
+            contexts[item.instance_id]["prefill_raw"] = prefill_raw
+            contexts[item.instance_id]["decode_raw"] = decode_raw
+            contexts[item.instance_id]["prefill_norm"] = (
+                min(prefill_raw, config.PROXY_RL_MAX_QUEUE_FEATURE)
+                / config.PROXY_RL_MAX_QUEUE_FEATURE
+            )
+            contexts[item.instance_id]["decode_norm"] = (
+                min(decode_raw, config.PROXY_RL_MAX_QUEUE_FEATURE)
+                / config.PROXY_RL_MAX_QUEUE_FEATURE
+            )
+
         decision = strategy.choose(safe_instances, contexts)
         chosen = next(item for item in safe_instances if item.instance_id == decision.instance_id)
+        queue_mgr.reserve_route(chosen.instance_id)
         selection_trace.update({
             "applied_instance_strategy": "linucb",
             "selection_phase": decision.phase,
             "selection_reason": "linucb_decision",
             "selected_instance_id": chosen.instance_id,
             "rl_effective_updates": decision.effective_updates,
+            "rl_arm_updates": strategy.arm_updates,
             "rl_candidate_scores": decision.candidate_scores,
             "rl_candidate_features": decision.candidate_features,
+            "route_reservation_after": queue_mgr.get_route_reservation(
+                chosen.instance_id
+            ),
         })
         return chosen, decision, selection_trace
     except Exception as e:
@@ -775,6 +834,7 @@ async def proxy_chat_completions(request: FastAPIRequest):
     # ====================================
     # 送入队列enqueue -> manager -> forward
     # ====================================
+    route_enqueued = False
     try:
         # 1) 封装任务（注：chosen 来自 RR，具备 instance_id/host/port 字段 :contentReference[oaicite:5]{index=5}）
         task = ProxyTask(
@@ -798,11 +858,14 @@ async def proxy_chat_completions(request: FastAPIRequest):
             task.trace["rl_score_milli"] = int(rl_decision.score * 1000)
 
         await queue_mgr.enqueue_prepare(task)
+        route_enqueued = True
 
         stream_gen = _wrap_chat_stream_with_meta(task, queue_mgr)
         return StreamingResponse(stream_gen, media_type="text/event-stream")
 
     except Exception as e:
+        if not route_enqueued:
+            queue_mgr.release_route(chosen.instance_id)
         logger.exception("[Proxy] 调用 Worker(chat) 失败")
         return JSONResponse(
             status_code=502,
@@ -950,6 +1013,7 @@ async def proxy_completions(request: FastAPIRequest):
     # ==================================
     # 送入队列enqueue -> drain -> forward
     # ==================================
+    route_enqueued = False
     try:
         task = ProxyTask(
             request_id=getattr(req_obj, "Request_ID", None),
@@ -969,6 +1033,7 @@ async def proxy_completions(request: FastAPIRequest):
         task.trace["selected_instance_control_port"] = int(task.instance_control_port or config.INSTANCE_CP_PORT)
 
         await queue_mgr.enqueue_prepare(task)
+        route_enqueued = True
 
         content_bytes = b""
         async for chunk in queue_mgr.iter_response(task):
@@ -997,6 +1062,8 @@ async def proxy_completions(request: FastAPIRequest):
             )
 
     except Exception as e:
+        if not route_enqueued:
+            queue_mgr.release_route(chosen.instance_id)
         logger.exception("[Proxy] 调用 Worker(completions) 失败")
         return JSONResponse(
             status_code=502,
