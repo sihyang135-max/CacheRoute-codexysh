@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
+from util.openai_stream import observe_stream_payload
 
 TRACE_ORDER_TOLERANCE_MS = 2
 
@@ -344,8 +345,15 @@ async def read_chat_stream_meta(
     url: str,
     headers: Dict[str, str],
     body: Dict[str, Any],
-) -> Tuple[int, Dict[str, Any]]:
+    request_start_ts: float,
+) -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
     meta: Dict[str, Any] = {}
+    stream_metrics: Dict[str, Any] = {
+        "client_first_chunk_ms": None,
+        "client_ttft_ms": None,
+        "output_chars": 0,
+        "completion_tokens": None,
+    }
 
     async with client.stream("POST", url, headers=headers, json=body) as resp:
         status = resp.status_code
@@ -374,10 +382,21 @@ async def read_chat_stream_meta(
                         meta = json.loads(data)
                     except Exception:
                         meta = {"raw_meta": data}
+                    continue
+
+                now = time.time()
+                if stream_metrics["client_first_chunk_ms"] is None:
+                    stream_metrics["client_first_chunk_ms"] = int((now - request_start_ts) * 1000)
+                observation = observe_stream_payload(data)
+                stream_metrics["output_chars"] += int(observation["output_chars"])
+                if observation["has_token"] and stream_metrics["client_ttft_ms"] is None:
+                    stream_metrics["client_ttft_ms"] = int((now - request_start_ts) * 1000)
+                if observation["completion_tokens"] is not None:
+                    stream_metrics["completion_tokens"] = int(observation["completion_tokens"])
 
         if not meta:
-            return status, {"error": "missing_cacheroute_meta"}
-        return status, meta
+            return status, {"error": "missing_cacheroute_meta"}, stream_metrics
+        return status, meta, stream_metrics
 
 
 async def read_completions_meta(
@@ -508,8 +527,11 @@ async def run_one(
     actual_send_ts = time.time()
     t0 = actual_send_ts
 
+    stream_metrics: Dict[str, Any] = {}
     if is_stream(body):
-        status, meta = await read_chat_stream_meta(client, url, headers, body)
+        status, meta, stream_metrics = await read_chat_stream_meta(
+            client, url, headers, body, request_start_ts=t0
+        )
     else:
         status, meta = await read_completions_meta(client, url, headers, body)
 
@@ -528,6 +550,12 @@ async def run_one(
     trace_key_count = len(trace) if isinstance(trace, dict) else 0
     trace_has_first_token = bool(isinstance(trace, dict) and "first_token_ms" in trace)
     trace_has_forward_start = bool(isinstance(trace, dict) and "forward_start_ms" in trace)
+    response_error = meta.get("error") if isinstance(meta, dict) else None
+    success = bool(
+        200 <= status < 300
+        and not response_error
+        and (not is_stream(body) or stream_metrics.get("client_ttft_ms") is not None)
+    )
 
     client_send_delay_ms: Optional[int] = None
     if scheduled_send_ts is not None:
@@ -538,14 +566,19 @@ async def run_one(
         "name": name,
         "url_path": url_path,
         "http_status": status,
+        "success": success,
         "wall_ms": int((t1 - t0) * 1000),
+        "client_first_chunk_ms": stream_metrics.get("client_first_chunk_ms"),
+        "client_ttft_ms": stream_metrics.get("client_ttft_ms"),
+        "output_chars": int(stream_metrics.get("output_chars", 0) or 0),
+        "completion_tokens": stream_metrics.get("completion_tokens"),
         "metrics": metrics,
         "trace": trace,
         "kv_ack": meta.get("kv_ack", {}) if isinstance(meta, dict) else {},
         "miss_kids": meta.get("miss_kids", []) if isinstance(meta, dict) else [],
         "kv_ready_kids": meta.get("kv_ready_kids", []) if isinstance(meta, dict) else [],
         "text_only_kids": meta.get("text_only_kids", []) if isinstance(meta, dict) else [],
-        "error": meta.get("error") if isinstance(meta, dict) else None,
+        "error": response_error,
         "injection_type": actual_injection_type,
         "trace_warnings": trace_warnings,
         "meta_missing": meta_missing,
@@ -589,7 +622,8 @@ def summarize(
     print("Compact Request Performance Summary")
     print("=" * 160)
     print(
-        "idx | name | injection | server_injection_mode | text_actual_path | kvcache_actual_path | status | total_prefill_ms | "
+        "idx | name | injection | selected_instance | selection_phase | selection_reason | "
+        "server_injection_mode | text_actual_path | kvcache_actual_path | status | success | client_ttft_ms | total_prefill_ms | "
         "proxy_before_vllm_ms | proxy_queue_wait_ms | ready_dequeue_to_forward_ms | "
         "proxy_wait_until_forward_ms | proxy_enqueue_to_forward_ms | proxy_recv_to_forward_ms | "
         "prepare_queue_wait_ms | prepare_worker_gap_ms | kdn_fetch_ms | kv_ack_ms | "
@@ -607,10 +641,15 @@ def summarize(
             f"{r['req_index']:03d} | "
             f"{r['name']} | "
             f"{r['injection_type']} | "
+            f"{fmt(t.get('selected_instance_id'))} | "
+            f"{fmt(t.get('selection_phase'))} | "
+            f"{fmt(t.get('selection_reason'))} | "
             f"{fmt(t.get('injection_mode'))} | "
             f"{fmt(t.get('text_actual_path'))} | "
             f"{fmt(t.get('kvcache_actual_path'))} | "
             f"{r['http_status']} | "
+            f"{r.get('success')} | "
+            f"{fmt(r.get('client_ttft_ms'))} | "
             f"{fmt(m.get('total_prefill_ms'))} | "
             f"{fmt(m.get('proxy_before_vllm_ms'))} | "
             f"{fmt(m.get('proxy_queue_wait_ms'))} | "
@@ -688,7 +727,18 @@ def summarize(
         print(f"Prefill min: {min(prefill_vals)} ms")
         print(f"Prefill max: {max(prefill_vals)} ms")
 
-    wall_vals = [r["wall_ms"] for r in results if isinstance(r.get("wall_ms"), int)]
+    successful_results = [r for r in results if r.get("success") is True]
+    client_ttft_vals = [
+        int(r["client_ttft_ms"])
+        for r in successful_results
+        if isinstance(r.get("client_ttft_ms"), int)
+    ]
+    if client_ttft_vals:
+        print(f"Client TTFT avg: {int(statistics.mean(client_ttft_vals))} ms")
+        print(f"Client TTFT min: {min(client_ttft_vals)} ms")
+        print(f"Client TTFT max: {max(client_ttft_vals)} ms")
+
+    wall_vals = [r["wall_ms"] for r in successful_results if isinstance(r.get("wall_ms"), int)]
     if wall_vals:
         print(f"Average end-to-end wall time: {int(statistics.mean(wall_vals))} ms")
 
@@ -705,6 +755,10 @@ def summarize(
                 "idx": r.get("req_index"),
                 "name": r.get("name"),
                 "injection": r.get("injection_type"),
+                "success": r.get("success"),
+                "client_first_chunk_ms": r.get("client_first_chunk_ms"),
+                "client_ttft_ms": r.get("client_ttft_ms"),
+                "completion_tokens": r.get("completion_tokens"),
                 "trace": r.get("trace", {}),
                 "metrics": r.get("metrics", {}),
             }, ensure_ascii=False, indent=2))
@@ -715,7 +769,16 @@ def summarize(
         print(f"Target RPS: {target_rps}")
     print(f"Total elapsed time: {total_elapsed_s:.3f} s")
     if total_elapsed_s > 0:
-        print(f"Actual throughput: {len(results) / total_elapsed_s:.3f} req/s")
+        print(f"Completed throughput: {len(results) / total_elapsed_s:.3f} req/s")
+        print(f"Successful throughput: {len(successful_results) / total_elapsed_s:.3f} req/s")
+        completion_tokens = [
+            int(r["completion_tokens"])
+            for r in successful_results
+            if isinstance(r.get("completion_tokens"), int)
+        ]
+        if completion_tokens:
+            print(f"Output token throughput: {sum(completion_tokens) / total_elapsed_s:.3f} token/s")
+    print(f"Successful requests: {len(successful_results)}/{len(results)}")
     print(f"Peak inflight requests: {peak_inflight}")
 
     warning_results = [
@@ -906,6 +969,14 @@ async def main_async(args: argparse.Namespace) -> None:
         gpu_stop_event.set()
         gpu_samples = await gpu_task
 
+    if args.output_jsonl:
+        output_path = Path(args.output_jsonl)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as f:
+            for result in results:
+                f.write(json.dumps(result, ensure_ascii=False) + "\n")
+        print(f"Wrote per-request results: {output_path}")
+
     summarize(
         results=results,
         mode=args.mode,
@@ -1022,6 +1093,11 @@ def main() -> None:
         "--print-trace",
         action="store_true",
         help="print per-request trace and metrics as JSON",
+    )
+    parser.add_argument(
+        "--output-jsonl",
+        default=None,
+        help="optional path for one JSON object per completed request",
     )
     parser.add_argument(
         "--monitor-gpu",

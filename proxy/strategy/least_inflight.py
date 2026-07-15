@@ -12,7 +12,14 @@ class LeastInflightStrategy(BaseInstanceStrategy):
     def select(self, instances: List[InstanceLike], hint: Optional[Any] = None) -> InstanceLike:
         if not instances:
             raise RuntimeError("no instances")
+        local_inflight = hint.get("instance_inflight", {}) if isinstance(hint, dict) else {}
+
+        def load(item: InstanceLike) -> int:
+            if item.instance_id in local_inflight:
+                return int(local_inflight[item.instance_id])
+            return int(getattr(getattr(item, "load", None), "inflight", 0) or 0)
+
         return min(
             instances,
-            key=lambda item: (int(getattr(getattr(item, "load", None), "inflight", 0) or 0), item.instance_id),
+            key=lambda item: (load(item), item.instance_id),
         )

@@ -11,6 +11,7 @@ from typing import Dict, Optional, AsyncGenerator, Any, List, Set
 from core import forward_request,config
 from proxy.metrics.queue_predictor import queue_predictor, decode_tpot_predictor, predict_redis_pull_ms
 from proxy.resource import p_control_plane
+from util.openai_stream import OpenAIStreamObserver
 
 from .task import ProxyTask
 from .instance_queues import PerInstanceQueueMap
@@ -1117,6 +1118,7 @@ class QueueManager:
                 task.trace["forward_start_ms"] = _now_ms()
 
                 seen_first_chunk = False
+                stream_observer = OpenAIStreamObserver()
                 async for chunk in forward_request(
                     url=target_url,
                     data=task.instance_body,
@@ -1125,6 +1127,9 @@ class QueueManager:
                     if chunk:
                         if not seen_first_chunk:
                             seen_first_chunk = True
+                            task.trace["first_response_chunk_ms"] = _now_ms()
+                        token_observed = (not use_chunked) or bool(stream_observer.feed(chunk)["has_token"])
+                        if "first_token_ms" not in task.trace and token_observed:
                             task.trace["first_token_ms"] = _now_ms()
                             task.trace["ttft_observable"] = 1 if use_chunked else 0
                             if use_chunked:
@@ -1277,7 +1282,7 @@ class QueueManager:
         调 Instance 控制平面，请求对 kv_ready_kids 执行 KV 注入。
         """
         instance_cp_host = task.instance_host
-        instance_cp_port = 9002  # 第一版先固定，后续可配到 config/env
+        instance_cp_port = task.resolve_instance_control_port(config.INSTANCE_CP_PORT)
 
         url = f"http://{instance_cp_host}:{instance_cp_port}/v1/kv/inject_ready"
         payload = {

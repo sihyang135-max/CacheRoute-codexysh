@@ -40,7 +40,7 @@ from proxy.resource.instance_pool import InstancePool
 from proxy.resource import p_control_plane
 from proxy.resource.hb_log import HeartbeatReporter, hb_report_loop
 from proxy.strategy.factory import build_instance_strategy
-from proxy.strategy.linucb import LinUCBStrategy, Decision
+from proxy.strategy.linucb import LinUCBStrategy, Decision, ttft_reward
 from proxy.queue import QueueManager, ProxyTask
 from proxy.metrics.prometheus_cache import PrometheusCache
 
@@ -369,6 +369,8 @@ def build_body_for_instance(req_obj: SchedulerRequest, mode: str) -> Dict[str, A
             ],
             "stream": stream,
         }
+        if stream:
+            body["stream_options"] = {"include_usage": True}
     else:
         # completions：prompt + 非流式
         body = {
@@ -386,6 +388,15 @@ def build_body_for_instance(req_obj: SchedulerRequest, mode: str) -> Dict[str, A
         body["top_p"] = top_p
 
     return body
+
+
+def _instance_control_port(instance: Any) -> int:
+    meta = getattr(instance, "meta", {}) or {}
+    try:
+        port = int(meta.get("control_port") or config.INSTANCE_CP_PORT)
+    except (TypeError, ValueError):
+        port = int(config.INSTANCE_CP_PORT)
+    return port if port > 0 else int(config.INSTANCE_CP_PORT)
 
 
 def build_cacheroute_meta(task: ProxyTask) -> Dict[str, Any]:
@@ -410,11 +421,13 @@ def _sse_meta_event(task: ProxyTask) -> bytes:
 def _linucb_reward(task: ProxyTask) -> float:
     first = task.trace.get("first_token_ms")
     enqueued = task.trace.get("proxy_enqueue_ms")
-    slo = int(getattr(getattr(task.req_obj, "Service", None), "SLO_TTFT", 0) or 0)
-    if not isinstance(first, int) or not isinstance(enqueued, int) or slo <= 0:
-        return -5.0
-    ratio = max(0.0, (first - enqueued) / float(slo))
-    return -(min(ratio, 3.0) + (2.0 if ratio > 1.0 else 0.0))
+    if not isinstance(first, int) or not isinstance(enqueued, int):
+        return -float(config.PROXY_RL_REWARD_CLIP)
+    return ttft_reward(
+        ttft_ms=max(0, first - enqueued),
+        scale_ms=config.PROXY_RL_REWARD_TTFT_SCALE_MS,
+        clip=config.PROXY_RL_REWARD_CLIP,
+    )
 
 
 def _update_linucb_once(task: ProxyTask) -> None:
@@ -424,10 +437,20 @@ def _update_linucb_once(task: ProxyTask) -> None:
     strategy = getattr(proxy.state, "instance_strategy", None)
     if not isinstance(strategy, LinUCBStrategy) or not isinstance(features, list):
         return
+    first = task.trace.get("first_token_ms")
+    enqueued = task.trace.get("proxy_enqueue_ms")
+    if isinstance(first, int) and isinstance(enqueued, int):
+        task.trace["rl_observed_ttft_ms"] = max(0, first - enqueued)
+    task.trace["rl_slo_ttft_ms"] = int(
+        getattr(getattr(task.req_obj, "Service", None), "SLO_TTFT", 0) or 0
+    )
+    task.trace["rl_reward_ttft_scale_ms"] = float(config.PROXY_RL_REWARD_TTFT_SCALE_MS)
+    task.trace["rl_reward_clip"] = float(config.PROXY_RL_REWARD_CLIP)
     reward = _linucb_reward(task)
     strategy.update(features, reward)
     task.trace["rl_updated"] = 1
     task.trace["rl_reward_milli"] = int(reward * 1000)
+    task.trace["rl_effective_updates_after"] = strategy.effective_updates
 
 
 async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) -> AsyncGenerator[bytes, None]:
@@ -442,8 +465,10 @@ async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) 
             if not chunk:
                 continue
 
-            # QueueManager records first_token_ms before placing the first chunk.
-            _update_linucb_once(task)
+            # Role-only SSE chunks are not tokens. Update only after QueueManager
+            # has observed non-empty content/reasoning content.
+            if isinstance(task.trace.get("first_token_ms"), int):
+                _update_linucb_once(task)
 
             pending += chunk
 
@@ -471,7 +496,7 @@ async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) 
         yield b"data: [DONE]\n\n"
 
 
-async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any, Optional[Decision]]:
+async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any, Optional[Decision], Dict[str, Any]]:
     """
     业务面选择一个 instance。
     - 输入：当前存活实例列表（由 InstancePool 提供）
@@ -481,17 +506,55 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
     strategy = app.state.instance_strategy  # type: ignore
 
     instances = pool.list(include_dead=False)
+    selection_trace: Dict[str, Any] = {
+        "configured_instance_strategy": str(getattr(strategy, "name", type(strategy).__name__)),
+        "alive_instance_count": len(instances),
+    }
     if not instances:
-        return None, None
+        selection_trace.update({"selection_phase": "failed", "selection_reason": "no_alive_instances"})
+        return None, None, selection_trace
+
+    local_inflight_hint = {"instance_inflight": {}}
+    for item in instances:
+        snapshot = queue_mgr.get_instance_rl_snapshot(item.instance_id)
+        local_inflight_hint["instance_inflight"][item.instance_id] = (
+            int(snapshot["prefill_count"]) + int(snapshot["decode_count"])
+        )
 
     try:
-        if not config.PROXY_RL_ENABLED or not isinstance(strategy, LinUCBStrategy):
-            return strategy.select(instances, hint=req_obj), None
+        if not config.PROXY_RL_ENABLED:
+            applied_strategy = strategy if not isinstance(strategy, LinUCBStrategy) else build_instance_strategy("least_inflight")
+            hint = local_inflight_hint if getattr(applied_strategy, "name", "") == "least_inflight" else req_obj
+            chosen = applied_strategy.select(instances, hint=hint)
+            selection_trace.update({
+                "applied_instance_strategy": str(getattr(applied_strategy, "name", type(applied_strategy).__name__)),
+                "selection_phase": "fallback" if isinstance(strategy, LinUCBStrategy) else "baseline",
+                "selection_reason": "linucb_disabled" if isinstance(strategy, LinUCBStrategy) else "configured_non_linucb_strategy",
+                "selected_instance_id": chosen.instance_id,
+            })
+            return chosen, None, selection_trace
+        if not isinstance(strategy, LinUCBStrategy):
+            hint = local_inflight_hint if getattr(strategy, "name", "") == "least_inflight" else req_obj
+            chosen = strategy.select(instances, hint=hint)
+            selection_trace.update({
+                "applied_instance_strategy": str(getattr(strategy, "name", type(strategy).__name__)),
+                "selection_phase": "baseline",
+                "selection_reason": "configured_non_linucb_strategy",
+                "selected_instance_id": chosen.instance_id,
+            })
+            return chosen, None, selection_trace
 
         service = req_obj.Service
         prompt = req_obj.Prompt
         if (not bool(getattr(prompt, "stream", False))) or str(getattr(service, "Injection_type", "")).lower() != "kvcache":
-            return build_instance_strategy("least_inflight").select(instances), None
+            chosen = build_instance_strategy("least_inflight").select(instances, hint=local_inflight_hint)
+            selection_trace.update({
+                "applied_instance_strategy": "least_inflight",
+                "selection_phase": "fallback",
+                "selection_reason": "linucb_requires_streaming_kvcache",
+                "selected_instance_id": chosen.instance_id,
+            })
+            return chosen, None, selection_trace
 
         cache: PrometheusCache = app.state.prometheus_cache  # type: ignore
         kdn_addr = str(getattr(req_obj.Task, "KDN_server_addr", "") or "")
@@ -500,14 +563,24 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
         kv_len = (knowledge_len // 256) * 256
         contexts: Dict[str, Dict[str, Any]] = {}
         safe_instances = []
+        excluded_instances: Dict[str, str] = {}
         for item in instances:
             metric = cache.get(item.instance_id)
-            if metric is None or not metric.is_fresh(config.PROXY_RL_PROMETHEUS_STALE_S):
+            if metric is None:
+                excluded_instances[item.instance_id] = "metrics_missing"
                 continue
-            if metric.failures >= config.PROXY_RL_PROMETHEUS_FAILURE_LIMIT or metric.kv_usage >= config.PROXY_RL_KV_USAGE_LIMIT:
+            if not metric.is_fresh(config.PROXY_RL_PROMETHEUS_STALE_S):
+                excluded_instances[item.instance_id] = "metrics_stale"
+                continue
+            if metric.failures >= config.PROXY_RL_PROMETHEUS_FAILURE_LIMIT:
+                excluded_instances[item.instance_id] = "metrics_failures"
+                continue
+            if metric.kv_usage >= config.PROXY_RL_KV_USAGE_LIMIT:
+                excluded_instances[item.instance_id] = "kv_usage_limit"
                 continue
             q = queue_mgr.get_instance_rl_snapshot(item.instance_id)
             if q["prepare_queue_size"] >= 256 or q["ready_queue_size"] >= 256:
+                excluded_instances[item.instance_id] = "proxy_queue_limit"
                 continue
             link = await p_control_plane.get_instance_kdn_link(item.instance_id, kdn_addr)
             bw_mbps = max(1.0, float(link.get("bandwidth_mbps", config.INSTANCE_DEFAULT_LINK_BW_MBPS) or config.INSTANCE_DEFAULT_LINK_BW_MBPS))
@@ -525,14 +598,39 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
                 "decode_raw": decode_raw,
             }
             safe_instances.append(item)
+        selection_trace.update({
+            "linucb_safe_instance_count": len(safe_instances),
+            "linucb_excluded_instances": excluded_instances,
+        })
         if len(safe_instances) < 2:
-            return build_instance_strategy("least_inflight").select(instances), None
+            chosen = build_instance_strategy("least_inflight").select(instances, hint=local_inflight_hint)
+            selection_trace.update({
+                "applied_instance_strategy": "least_inflight",
+                "selection_phase": "fallback",
+                "selection_reason": "insufficient_safe_linucb_candidates",
+                "selected_instance_id": chosen.instance_id,
+            })
+            return chosen, None, selection_trace
         decision = strategy.choose(safe_instances, contexts)
         chosen = next(item for item in safe_instances if item.instance_id == decision.instance_id)
-        return chosen, decision
+        selection_trace.update({
+            "applied_instance_strategy": "linucb",
+            "selection_phase": decision.phase,
+            "selection_reason": "linucb_decision",
+            "selected_instance_id": chosen.instance_id,
+            "rl_effective_updates": decision.effective_updates,
+            "rl_candidate_scores": decision.candidate_scores,
+            "rl_candidate_features": decision.candidate_features,
+        })
+        return chosen, decision, selection_trace
     except Exception as e:
         logger.warning("[Proxy] instance select failed: err=%s", str(e))
-        return None, None
+        selection_trace.update({
+            "selection_phase": "failed",
+            "selection_reason": "selection_exception",
+            "selection_error": str(e),
+        })
+        return None, None, selection_trace
 
 
 #--------------------------------------------------------------
@@ -569,7 +667,7 @@ async def proxy_chat_completions(request: FastAPIRequest):
     instance_body = build_body_for_instance(req_obj, mode="chat")
 
     route_select_start_ms = int(time.time() * 1000)
-    chosen, rl_decision = await select_instance(proxy, req_obj)
+    chosen, rl_decision, selection_trace = await select_instance(proxy, req_obj)
     route_select_end_ms = int(time.time() * 1000)
     if not chosen:
         return JSONResponse(
@@ -686,12 +784,15 @@ async def proxy_chat_completions(request: FastAPIRequest):
             instance_id=chosen.instance_id,
             instance_host=chosen.host,
             instance_port=int(chosen.port),
+            instance_control_port=_instance_control_port(chosen),
             kdn_addr=getattr(req_obj.Task, "KDN_server_addr", None),
             url_path=url_path,
         )
         task.trace["proxy_recv_ms"] = proxy_recv_ms
         task.trace["route_select_start_ms"] = route_select_start_ms
         task.trace["route_select_end_ms"] = route_select_end_ms
+        task.trace.update(selection_trace)
+        task.trace["selected_instance_control_port"] = int(task.instance_control_port or config.INSTANCE_CP_PORT)
         if rl_decision is not None:
             task.trace["rl_features"] = rl_decision.features
             task.trace["rl_score_milli"] = int(rl_decision.score * 1000)
@@ -740,7 +841,7 @@ async def proxy_completions(request: FastAPIRequest):
     instance_body = build_body_for_instance(req_obj, mode="completions")
 
     route_select_start_ms = int(time.time() * 1000)
-    chosen, rl_decision = await select_instance(proxy, req_obj)
+    chosen, rl_decision, selection_trace = await select_instance(proxy, req_obj)
     route_select_end_ms = int(time.time() * 1000)
     if not chosen:
         return JSONResponse(
@@ -857,12 +958,15 @@ async def proxy_completions(request: FastAPIRequest):
             instance_id=chosen.instance_id,
             instance_host=chosen.host,
             instance_port=int(chosen.port),
+            instance_control_port=_instance_control_port(chosen),
             kdn_addr=getattr(req_obj.Task, "KDN_server_addr", None),
             url_path=url_path,
         )
         task.trace["proxy_recv_ms"] = proxy_recv_ms
         task.trace["route_select_start_ms"] = route_select_start_ms
         task.trace["route_select_end_ms"] = route_select_end_ms
+        task.trace.update(selection_trace)
+        task.trace["selected_instance_control_port"] = int(task.instance_control_port or config.INSTANCE_CP_PORT)
 
         await queue_mgr.enqueue_prepare(task)
 

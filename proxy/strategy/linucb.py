@@ -18,6 +18,16 @@ class Decision:
     features: List[float]
     score: float
     phase: str
+    effective_updates: int
+    candidate_scores: Dict[str, float]
+    candidate_features: Dict[str, List[float]]
+
+
+def ttft_reward(ttft_ms: float, scale_ms: float, clip: float) -> float:
+    """Return a bounded reward that directly minimizes observed TTFT."""
+    if scale_ms <= 0 or clip <= 0:
+        raise ValueError("scale_ms and clip must be positive")
+    return -min(max(0.0, float(ttft_ms)) / float(scale_ms), float(clip))
 
 
 class LinUCBStrategy(BaseInstanceStrategy):
@@ -64,23 +74,53 @@ class LinUCBStrategy(BaseInstanceStrategy):
             raise RuntimeError("no valid LinUCB contexts")
 
         with self._lock:
+            candidate_features = {
+                it.instance_id: self._vector(row).tolist()
+                for it, row in rows
+            }
             if self._effective_updates < self.warmup_requests:
                 # Deterministic Least-InFlight-like cold start using local queue state.
                 it, row = min(rows, key=lambda pair: (float(pair[1].get("prefill_raw", 0)) + float(pair[1].get("decode_raw", 0)), pair[0].instance_id))
-                return Decision(it.instance_id, self._vector(row).tolist(), 0.0, "warmup")
+                return Decision(
+                    instance_id=it.instance_id,
+                    features=candidate_features[it.instance_id],
+                    score=0.0,
+                    phase="warmup",
+                    effective_updates=self._effective_updates,
+                    candidate_scores={item.instance_id: 0.0 for item, _ in rows},
+                    candidate_features=candidate_features,
+                )
 
             theta = np.linalg.solve(self._A, self._b)
             inv_A = np.linalg.inv(self._A)
             best: Optional[Decision] = None
+            candidate_scores: Dict[str, float] = {}
             for it, row in rows:
                 x = self._vector(row)
                 bonus = self.alpha * math.sqrt(max(0.0, float(x @ inv_A @ x)))
                 score = float(theta @ x) + bonus
-                candidate = Decision(it.instance_id, x.tolist(), score, "linucb")
+                candidate_scores[it.instance_id] = score
+                candidate = Decision(
+                    instance_id=it.instance_id,
+                    features=x.tolist(),
+                    score=score,
+                    phase="linucb",
+                    effective_updates=self._effective_updates,
+                    candidate_scores={},
+                    candidate_features=candidate_features,
+                )
                 if best is None or candidate.score > best.score or (candidate.score == best.score and candidate.instance_id < best.instance_id):
                     best = candidate
             assert best is not None
-            return best
+            return Decision(
+                instance_id=best.instance_id,
+                features=best.features,
+                score=best.score,
+                phase=best.phase,
+                effective_updates=best.effective_updates,
+                candidate_scores=candidate_scores,
+                candidate_features=candidate_features,
+            )
 
     def select(self, instances: List[InstanceLike], hint: Optional[Any] = None) -> InstanceLike:
         contexts = (hint or {}).get("linucb_contexts", {}) if isinstance(hint, dict) else {}
@@ -100,4 +140,3 @@ class LinUCBStrategy(BaseInstanceStrategy):
     def effective_updates(self) -> int:
         with self._lock:
             return self._effective_updates
-

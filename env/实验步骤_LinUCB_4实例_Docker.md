@@ -18,7 +18,7 @@ chmod +x scripts/start_rl_4instance_*.sh
 export PROJECT_HOST=$(pwd)
 export MODEL_DIR=/workspace/llm-stack/models/<模型目录>
 export MODEL_NAME=<模型服务名>
-export PREWARM_COUNT=1       # 首次实验建议先预热 1 个知识块；设为 0 则跳过
+export PREWARM_COUNT=all     # 正式实验预热完整知识集；设为整数可做冒烟测试，0 表示跳过
 bash scripts/start_rl_4instance_docker.sh
 ```
 

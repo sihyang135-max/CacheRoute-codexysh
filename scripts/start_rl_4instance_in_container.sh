@@ -6,6 +6,31 @@ set -euo pipefail
 : "${MODEL_DIR:?MODEL_DIR is required}"
 : "${MODEL_NAME:?MODEL_NAME is required}"
 
+INSTANCE_COUNT="${INSTANCE_COUNT:-4}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
+PROXY_INSTANCE_STRATEGY="${PROXY_INSTANCE_STRATEGY:-linucb}"
+PROXY_RL_ENABLED="${PROXY_RL_ENABLED:-1}"
+PROXY_RL_ALPHA="${PROXY_RL_ALPHA:-0.4}"
+PROXY_RL_LAMBDA="${PROXY_RL_LAMBDA:-1.0}"
+PROXY_RL_WARMUP_REQUESTS="${PROXY_RL_WARMUP_REQUESTS:-30}"
+PROXY_RL_REWARD_TTFT_SCALE_MS="${PROXY_RL_REWARD_TTFT_SCALE_MS:-1000.0}"
+PROXY_RL_REWARD_CLIP="${PROXY_RL_REWARD_CLIP:-5.0}"
+
+case "$INSTANCE_COUNT" in
+  ''|*[!0-9]*) echo "[FAIL] INSTANCE_COUNT must be a positive integer"; exit 2 ;;
+esac
+case "$TENSOR_PARALLEL_SIZE" in
+  ''|*[!0-9]*) echo "[FAIL] TENSOR_PARALLEL_SIZE must be a positive integer"; exit 2 ;;
+esac
+if [ "$INSTANCE_COUNT" -lt 1 ] || [ "$TENSOR_PARALLEL_SIZE" -lt 1 ]; then
+  echo "[FAIL] INSTANCE_COUNT and TENSOR_PARALLEL_SIZE must be >= 1"
+  exit 2
+fi
+case "${PREWARM_COUNT:-0}" in
+  all|0) ;;
+  ''|*[!0-9]*) echo "[FAIL] PREWARM_COUNT must be 0, 'all', or a positive integer"; exit 2 ;;
+esac
+
 export PYTHONPATH="$PROJECT"
 export PYTHONHASHSEED=0
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
@@ -48,21 +73,24 @@ start_bg() {
 stop_old
 : > "$LOG_DIR/status.txt"
 
-# Four TP=2 Instances use all eight 5090 GPUs. MODEL_DIR must contain a model
-# that fits on two GPUs (or be launched with the appropriate quantization flags).
-for idx in 0 1 2 3; do
-  gpu0=$((idx * 2)); gpu1=$((gpu0 + 1)); vllm_port=$((18000 + idx))
-  CUDA_VISIBLE_DEVICES="$gpu0,$gpu1" start_bg "$LOG_DIR/vllm-${idx}.log" \
+# Defaults preserve the original four TP=2 layout. Set TENSOR_PARALLEL_SIZE=1
+# for four single-GPU instances.
+for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
+  gpu_start=$((idx * TENSOR_PARALLEL_SIZE))
+  gpu_end=$((gpu_start + TENSOR_PARALLEL_SIZE - 1))
+  gpu_ids="$(seq -s, "$gpu_start" "$gpu_end")"
+  vllm_port=$((18000 + idx))
+  CUDA_VISIBLE_DEVICES="$gpu_ids" start_bg "$LOG_DIR/vllm-${idx}.log" \
     python3 -m vllm.entrypoints.openai.api_server \
       --model "$MODEL_DIR" --served-model-name "$MODEL_NAME" \
       --host 127.0.0.1 --port "$vllm_port" \
-      --tensor-parallel-size 2 --gpu-memory-utilization 0.82 \
+      --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" --gpu-memory-utilization 0.82 \
       --max-model-len 4096 --max-num-seqs 8 --max-num-batched-tokens 8192 \
       --kv-offloading-backend lmcache --kv-offloading-size 32 \
       --disable-hybrid-kv-cache-manager --kv-cache-metrics
 done
 
-for idx in 0 1 2 3; do
+for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
   wait_http "http://127.0.0.1:$((18000 + idx))/v1/models" "vLLM-${idx}" 300
   if ! curl -s "http://127.0.0.1:$((18000 + idx))/metrics" | grep -Eq 'gpu.*cache.*usage|gpu_cache_usage'; then
     echo "[WARN] vLLM-${idx}: KVCache Prometheus metric was not found" | tee -a "$LOG_DIR/status.txt"
@@ -76,19 +104,21 @@ wait_http http://127.0.0.1:7001/debug/status Scheduler 120
 start_bg "$LOG_DIR/kdn.log" python3 demo_kdn.py
 wait_http http://127.0.0.1:9101/v1/topology/ping KDN 120
 
-export PROXY_INSTANCE_STRATEGY=linucb
-export PROXY_RL_ENABLED=1
-export PROXY_RL_ALPHA=0.4
-export PROXY_RL_LAMBDA=1.0
-export PROXY_RL_WARMUP_REQUESTS=30
+export PROXY_INSTANCE_STRATEGY
+export PROXY_RL_ENABLED
+export PROXY_RL_ALPHA
+export PROXY_RL_LAMBDA
+export PROXY_RL_WARMUP_REQUESTS
+export PROXY_RL_REWARD_TTFT_SCALE_MS
+export PROXY_RL_REWARD_CLIP
 export PROXY_RL_PROMETHEUS_INTERVAL_S=1.0
 export PROXY_RL_PROMETHEUS_TIMEOUT_S=0.2
 export PROXY_RL_PROMETHEUS_STALE_S=3.0
 export PROXY_RL_KV_USAGE_LIMIT=0.90
-start_bg "$LOG_DIR/proxy.log" python3 demo_proxy.py --strategy linucb --injection-strategy default
+start_bg "$LOG_DIR/proxy.log" python3 demo_proxy.py --strategy "$PROXY_INSTANCE_STRATEGY" --injection-strategy default
 wait_http http://127.0.0.1:8002/healthz Proxy 120
 
-for idx in 0 1 2 3; do
+for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
   vllm_port=$((18000 + idx)); instance_port=$((19001 + idx)); cp_port=$((19101 + idx))
   INSTANCE_ID="inst-${idx}" INSTANCE_CP_PORT="$cp_port" \
   PROXY_CP_URL=http://127.0.0.1:8002 \
@@ -101,14 +131,16 @@ done
 
 sleep 5
 curl -fsS http://127.0.0.1:8002/v1/instance/list > "$LOG_DIR/instances.json"
-grep -o 'inst-[0-3]' "$LOG_DIR/instances.json" | sort -u | wc -l | grep -qx 4 || {
-  echo "[FAIL] Four Instances did not register; inspect $LOG_DIR/instance-*.log" | tee -a "$LOG_DIR/status.txt"
+registered_count="$(grep -o 'inst-[0-9]\+' "$LOG_DIR/instances.json" | sort -u | wc -l)"
+if [ "$registered_count" -ne "$INSTANCE_COUNT" ]; then
+  echo "[FAIL] Expected $INSTANCE_COUNT Instances, found $registered_count; inspect $LOG_DIR/instance-*.log" | tee -a "$LOG_DIR/status.txt"
   exit 1
-}
-echo "[OK] Four Instances registered" | tee -a "$LOG_DIR/status.txt"
+fi
+echo "[OK] $INSTANCE_COUNT Instances registered" | tee -a "$LOG_DIR/status.txt"
+echo "[CONFIG] strategy=$PROXY_INSTANCE_STRATEGY rl_enabled=$PROXY_RL_ENABLED alpha=$PROXY_RL_ALPHA lambda=$PROXY_RL_LAMBDA warmup=$PROXY_RL_WARMUP_REQUESTS reward_scale_ms=$PROXY_RL_REWARD_TTFT_SCALE_MS reward_clip=$PROXY_RL_REWARD_CLIP tp=$TENSOR_PARALLEL_SIZE" | tee -a "$LOG_DIR/status.txt"
 
 # Optional, deliberately explicit: KV building may take a long time.
-if [ "${PREWARM_COUNT:-0}" -gt 0 ]; then
+if [ "${PREWARM_COUNT:-0}" != "0" ]; then
   cd "$PROJECT/kdn_server/util"
   python3 batch_register_kdn.py \
     --manifest knowledge_manifest_nq.json --count "$PREWARM_COUNT" \
@@ -118,4 +150,4 @@ if [ "${PREWARM_COUNT:-0}" -gt 0 ]; then
     --result-json "$LOG_DIR/kdn_prewarm.json"
 fi
 
-echo "[DONE] LinUCB 4-Instance environment is ready" | tee -a "$LOG_DIR/status.txt"
+echo "[DONE] $PROXY_INSTANCE_STRATEGY $INSTANCE_COUNT-Instance environment is ready" | tee -a "$LOG_DIR/status.txt"

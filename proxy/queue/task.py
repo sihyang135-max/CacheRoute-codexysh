@@ -32,6 +32,7 @@ class ProxyTask:
     url_path: str                           # 本次请求对应的 URL path："/v1/chat/completions" or "/v1/completions"
 
     kdn_addr: str | None = None
+    instance_control_port: Optional[int] = None
 
     # per-task 响应通道：ready_worker push chunk，handler pull chunk
     response_queue: "asyncio.Queue[Optional[bytes]]" = field(
@@ -50,7 +51,7 @@ class ProxyTask:
     kv_ready_meta: list = field(default_factory=list)
 
     kv_ack: Dict[str, Any] = field(default_factory=dict)
-    trace: Dict[str, int] = field(default_factory=dict)
+    trace: Dict[str, Any] = field(default_factory=dict)
 
     # reservation state for ready/prefill timeline
     # prediction stage: "prefill" (default) or "decode" (reserved for future modeling)
@@ -71,3 +72,10 @@ class ProxyTask:
 
     def mark(self, key: str, ts_ms: int) -> None:
         self.trace[key] = int(ts_ms)
+
+    def resolve_instance_control_port(self, default_port: int) -> int:
+        try:
+            port = int(self.instance_control_port or default_port)
+        except (TypeError, ValueError):
+            port = int(default_port)
+        return port if port > 0 else int(default_port)
