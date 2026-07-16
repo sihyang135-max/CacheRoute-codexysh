@@ -109,9 +109,11 @@ PROXY_RL_PROMETHEUS_INTERVAL_S = float(os.environ.get("PROXY_RL_PROMETHEUS_INTER
 PROXY_RL_PROMETHEUS_TIMEOUT_S = float(os.environ.get("PROXY_RL_PROMETHEUS_TIMEOUT_S", "0.2"))
 PROXY_RL_PROMETHEUS_STALE_S = float(os.environ.get("PROXY_RL_PROMETHEUS_STALE_S", "3.0"))
 PROXY_RL_PROMETHEUS_FAILURE_LIMIT = int(os.environ.get("PROXY_RL_PROMETHEUS_FAILURE_LIMIT", "3"))
-PROXY_RL_MAX_QUEUE_FEATURE = int(os.environ.get("PROXY_RL_MAX_QUEUE_FEATURE", "8"))
-PROXY_RL_MAX_TOKEN_FEATURE = int(os.environ.get("PROXY_RL_MAX_TOKEN_FEATURE", "4096"))
+PROXY_RL_COMPUTE_COST_SCALE_MS = float(os.environ.get("PROXY_RL_COMPUTE_COST_SCALE_MS", "1000.0"))
+PROXY_RL_KV_READY_COST_SCALE_MS = float(os.environ.get("PROXY_RL_KV_READY_COST_SCALE_MS", "1000.0"))
 PROXY_RL_DEFAULT_KV_MB_PER_TOKEN = float(os.environ.get("PROXY_RL_DEFAULT_KV_MB_PER_TOKEN", "0.096"))
+PROXY_RL_KV_RESIDENCY_SCOPE = os.environ.get("PROXY_RL_KV_RESIDENCY_SCOPE", "global").strip().lower()
+PROXY_RL_KV_LINK_SCOPE = os.environ.get("PROXY_RL_KV_LINK_SCOPE", "global").strip().lower()
 # ====================================================================#
 #                              Instance                               #
 # ====================================================================#

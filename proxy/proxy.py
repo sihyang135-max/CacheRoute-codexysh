@@ -20,7 +20,6 @@ import json
 import asyncio
 import logging
 import time
-import math
 import uvicorn
 
 from contextlib import asynccontextmanager
@@ -580,15 +579,26 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
                 "fallback",
                 "linucb_requires_streaming",
             )
+        if injection_type != "kvcache":
+            return choose_and_reserve(
+                build_instance_strategy("least_inflight"),
+                "fallback",
+                "linucb_requires_kvcache",
+            )
 
         cache: PrometheusCache = app.state.prometheus_cache  # type: ignore
+        context_started_ns = time.perf_counter_ns()
         kdn_addr = str(getattr(req_obj.Task, "KDN_server_addr", "") or "")
-        prompt_len = max(0, int(getattr(prompt, "token_length", 0) or 0))
         knowledge_len = max(0, int(getattr(service, "Knowledge_length", 0) or 0))
-        kv_len = (
-            (knowledge_len // 256) * 256
-            if injection_type == "kvcache"
-            else 0
+        knowledge_list = [
+            str(kid) for kid in (getattr(service, "Knowledge_List", []) or [])
+        ]
+        kv_len = (knowledge_len // 256) * 256
+        kv_size_mb = kv_len * config.PROXY_RL_DEFAULT_KV_MB_PER_TOKEN
+        kvcache_service = queue_mgr.estimate_kvcache_service_ms(req_obj)
+        residual_prefill_ms = max(
+            0.0,
+            float(kvcache_service.get("residual_prefill_ms", 0) or 0),
         )
         contexts: Dict[str, Dict[str, Any]] = {}
         safe_instances = []
@@ -611,25 +621,76 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
             if q["prepare_queue_size"] >= 256 or q["ready_queue_size"] >= 256:
                 excluded_instances[item.instance_id] = "proxy_queue_limit"
                 continue
-            link = await p_control_plane.get_instance_kdn_link(item.instance_id, kdn_addr)
-            bw_mbps = max(1.0, float(link.get("bandwidth_mbps", config.INSTANCE_DEFAULT_LINK_BW_MBPS) or config.INSTANCE_DEFAULT_LINK_BW_MBPS))
-            transfer_ms = (kv_len * config.PROXY_RL_DEFAULT_KV_MB_PER_TOKEN * 8.0 * 1000.0) / bw_mbps
-            prefill_raw = q["prefill_count"] + q["prepare_queue_size"] + q["ready_queue_size"]
-            decode_raw = q["decode_count"]
+
+            meta = item.meta or {}
+            compute_capacity = max(
+                1e-6,
+                float(meta.get("prefill_capacity_ratio", 1.0) or 1.0),
+            )
+            compute_wait_ms = queue_mgr.get_compute_wait_snapshot_ms(item.instance_id)
+            compute_cost_ms = (
+                float(compute_wait_ms) + residual_prefill_ms
+            ) / compute_capacity
+
+            delivery = queue_mgr.get_kv_delivery_snapshot(
+                item.instance_id,
+                kdn_addr,
+                knowledge_list,
+            )
+            link = p_control_plane.get_instance_kdn_link_snapshot(
+                item.instance_id,
+                kdn_addr,
+            )
+            observed_mbps = float(delivery["observed_delivery_mbps"])
+            reported_mbps = float(
+                link.get("bandwidth_mbps", config.INSTANCE_DEFAULT_LINK_BW_MBPS)
+                or config.INSTANCE_DEFAULT_LINK_BW_MBPS
+            )
+            bw_mbps = max(
+                1.0,
+                min(observed_mbps, reported_mbps)
+                if observed_mbps > 0.0
+                else reported_mbps,
+            )
+            latency_ms = max(
+                0.0,
+                float(link.get("latency_ms", link.get("rtt_ms", 0.0)) or 0.0),
+            )
+            missing_ratio = min(1.0, max(0.0, float(delivery["missing_ratio"])))
+            transfer_ms = (
+                kv_size_mb * missing_ratio * 8.0 * 1000.0 / bw_mbps
+                if kv_size_mb > 0.0 and missing_ratio > 0.0
+                else 0.0
+            )
+            pending_transfers = max(0.0, float(delivery["pending_transfers"]))
+            kv_ready_cost_ms = (
+                latency_ms + transfer_ms * (1.0 + pending_transfers)
+                if transfer_ms > 0.0
+                else 0.0
+            )
             contexts[item.instance_id] = {
-                "prompt_norm": math.log1p(prompt_len) / math.log1p(config.PROXY_RL_MAX_TOKEN_FEATURE),
-                "kv_norm": math.log1p(kv_len) / math.log1p(config.PROXY_RL_MAX_TOKEN_FEATURE),
-                "prefill_norm": min(prefill_raw, config.PROXY_RL_MAX_QUEUE_FEATURE) / config.PROXY_RL_MAX_QUEUE_FEATURE,
-                "decode_norm": min(decode_raw, config.PROXY_RL_MAX_QUEUE_FEATURE) / config.PROXY_RL_MAX_QUEUE_FEATURE,
-                "kv_usage": metric.kv_usage,
-                "net_norm": math.log1p(max(0.0, transfer_ms)) / math.log1p(1000.0),
-                "prefill_raw": prefill_raw,
-                "decode_raw": decode_raw,
+                "compute_cost_ms": compute_cost_ms,
+                "kv_ready_cost_ms": kv_ready_cost_ms,
+                "compute_wait_ms": float(compute_wait_ms),
+                "residual_prefill_ms": residual_prefill_ms,
+                "compute_capacity_ratio": compute_capacity,
+                "missing_kv_ratio": missing_ratio,
+                "pending_kv_transfers": pending_transfers,
+                "kv_transfer_ms": transfer_ms,
+                "kv_bandwidth_mbps": bw_mbps,
+                "kv_bandwidth_source": (
+                    "delivery_ewma+topology_headroom"
+                    if observed_mbps > 0.0
+                    else "topology_headroom"
+                ),
+                "kv_latency_ms": latency_ms,
             }
             safe_instances.append(item)
+        context_build_us = (time.perf_counter_ns() - context_started_ns) // 1000
         selection_trace.update({
             "linucb_safe_instance_count": len(safe_instances),
             "linucb_excluded_instances": excluded_instances,
+            "rl_context_build_us": int(context_build_us),
         })
         if len(safe_instances) < 2:
             return choose_and_reserve(
@@ -638,34 +699,9 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
                 "insufficient_safe_linucb_candidates",
             )
 
-        # Link lookup awaits can overlap concurrent selections. Refresh local
-        # state immediately before choosing, then reserve synchronously so the
-        # next request sees this assignment before it reaches a queue.
-        for item in safe_instances:
-            snapshot = queue_mgr.get_instance_rl_snapshot(item.instance_id)
-            decode_raw = int(snapshot["decode_count"])
-            visible_prefill = (
-                int(snapshot["prefill_count"])
-                + int(snapshot["prepare_queue_size"])
-                + int(snapshot["ready_queue_size"])
-            )
-            outstanding = queue_mgr.get_route_reservation(item.instance_id)
-            prefill_raw = max(
-                visible_prefill,
-                max(0, outstanding - decode_raw),
-            )
-            contexts[item.instance_id]["prefill_raw"] = prefill_raw
-            contexts[item.instance_id]["decode_raw"] = decode_raw
-            contexts[item.instance_id]["prefill_norm"] = (
-                min(prefill_raw, config.PROXY_RL_MAX_QUEUE_FEATURE)
-                / config.PROXY_RL_MAX_QUEUE_FEATURE
-            )
-            contexts[item.instance_id]["decode_norm"] = (
-                min(decode_raw, config.PROXY_RL_MAX_QUEUE_FEATURE)
-                / config.PROXY_RL_MAX_QUEUE_FEATURE
-            )
-
+        score_started_ns = time.perf_counter_ns()
         decision = strategy.choose(safe_instances, contexts)
+        score_us = (time.perf_counter_ns() - score_started_ns) // 1000
         chosen = next(item for item in safe_instances if item.instance_id == decision.instance_id)
         queue_mgr.reserve_route(chosen.instance_id)
         selection_trace.update({
@@ -674,9 +710,16 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
             "selection_reason": "linucb_decision",
             "selected_instance_id": chosen.instance_id,
             "rl_effective_updates": decision.effective_updates,
+            "rl_effective_selections": strategy.effective_selections,
             "rl_arm_updates": strategy.arm_updates,
+            "rl_arm_selections": strategy.arm_selections,
+            "rl_feature_names": strategy.feature_names,
             "rl_candidate_scores": decision.candidate_scores,
+            "rl_candidate_exploit_scores": decision.candidate_exploit_scores,
+            "rl_candidate_exploration_bonuses": decision.candidate_exploration_bonuses,
             "rl_candidate_features": decision.candidate_features,
+            "rl_candidate_costs": contexts,
+            "rl_bandit_score_us": int(score_us),
             "route_reservation_after": queue_mgr.get_route_reservation(
                 chosen.instance_id
             ),

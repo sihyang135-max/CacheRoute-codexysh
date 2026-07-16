@@ -35,6 +35,8 @@ core_stub.config = SimpleNamespace(
     PROXY_RL_ALPHA=0.4,
     PROXY_RL_LAMBDA=1.0,
     PROXY_RL_WARMUP_REQUESTS=30,
+    PROXY_RL_COMPUTE_COST_SCALE_MS=1000.0,
+    PROXY_RL_KV_READY_COST_SCALE_MS=1000.0,
 )
 sys.modules["core"] = core_stub
 proxy_pkg = ModuleType("proxy")
@@ -75,16 +77,10 @@ class FakeInstance:
     weight: float = 1.0
 
 
-def context(prefill: int) -> dict:
+def context(compute_ms: float, kv_ready_ms: float = 0.0) -> dict:
     return {
-        "prompt_norm": 0.2,
-        "kv_norm": 0.8,
-        "prefill_norm": prefill / 8.0,
-        "decode_norm": 0.0,
-        "kv_usage": 0.1,
-        "net_norm": 0.4,
-        "prefill_raw": prefill,
-        "decode_raw": 0,
+        "compute_cost_ms": compute_ms,
+        "kv_ready_cost_ms": kv_ready_ms,
     }
 
 
@@ -96,7 +92,7 @@ class LinUCBObservabilityTest(unittest.TestCase):
 
     def test_decision_exposes_phase_candidates_and_update_count(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
-        contexts = {"inst-0": context(0), "inst-1": context(1)}
+        contexts = {"inst-0": context(100), "inst-1": context(200)}
         strategy = LinUCBStrategy(alpha=0.1, ridge=1.0, warmup_requests=1)
 
         warmup = strategy.choose(instances, contexts)
@@ -113,7 +109,7 @@ class LinUCBObservabilityTest(unittest.TestCase):
 
     def test_warmup_balances_updates_across_arms(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
-        contexts = {"inst-0": context(0), "inst-1": context(0)}
+        contexts = {"inst-0": context(100), "inst-1": context(100)}
         strategy = LinUCBStrategy(alpha=0.1, ridge=1.0, warmup_requests=4)
 
         for _ in range(4):
@@ -122,19 +118,81 @@ class LinUCBObservabilityTest(unittest.TestCase):
 
         self.assertEqual(strategy.arm_updates, {"inst-0": 2, "inst-1": 2})
 
-    def test_disjoint_models_learn_instance_specific_reward(self) -> None:
+    def test_concurrent_warmup_balances_selections_before_feedback(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
-        contexts = {"inst-0": context(0), "inst-1": context(0)}
-        strategy = LinUCBStrategy(alpha=0.0, ridge=1.0, warmup_requests=0)
-        features = strategy.choose(instances, contexts).features
+        contexts = {"inst-0": context(100), "inst-1": context(100)}
+        strategy = LinUCBStrategy(alpha=0.1, ridge=1.0, warmup_requests=4)
 
-        strategy.update("inst-0", features, reward=-1.0)
-        strategy.update("inst-1", features, reward=-0.1)
+        decisions = [strategy.choose(instances, contexts) for _ in range(4)]
+
+        self.assertEqual([item.phase for item in decisions], ["warmup"] * 4)
+        self.assertEqual(strategy.arm_selections, {"inst-0": 2, "inst-1": 2})
+        self.assertEqual(strategy.effective_updates, 0)
+
+    def test_higher_cost_cannot_increase_exploit_or_exploration_bonus(self) -> None:
+        instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
+        strategy = LinUCBStrategy(alpha=0.2, ridge=1.0, warmup_requests=0)
+        low = {"inst-0": context(100), "inst-1": context(900)}
+        high = {"inst-0": context(900), "inst-1": context(100)}
+
+        for _ in range(4):
+            low_decision = strategy.choose(instances, low)
+            strategy.update("inst-0", low_decision.candidate_features["inst-0"], reward=-0.1)
+            strategy.update("inst-1", low_decision.candidate_features["inst-1"], reward=-0.9)
+
+        low_decision = strategy.choose(instances, low)
+        high_decision = strategy.choose(instances, high)
+
+        self.assertLessEqual(
+            low_decision.candidate_exploit_scores["inst-1"],
+            low_decision.candidate_exploit_scores["inst-0"],
+        )
+        self.assertAlmostEqual(
+            low_decision.candidate_exploration_bonuses["inst-0"],
+            high_decision.candidate_exploration_bonuses["inst-0"],
+        )
+
+    def test_shared_model_learns_compute_cost_relation(self) -> None:
+        instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
+        contexts = {"inst-0": context(100), "inst-1": context(900)}
+        strategy = LinUCBStrategy(alpha=0.0, ridge=1.0, warmup_requests=0)
+        decision = strategy.choose(instances, contexts)
+        for _ in range(8):
+            strategy.update("inst-0", decision.candidate_features["inst-0"], reward=-0.1)
+            strategy.update("inst-1", decision.candidate_features["inst-1"], reward=-0.9)
 
         self.assertEqual(
             strategy.choose(instances, contexts).instance_id,
-            "inst-1",
+            "inst-0",
         )
+
+    def test_common_kv_cost_is_removed_from_every_candidate(self) -> None:
+        instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
+        strategy = LinUCBStrategy(alpha=0.0, ridge=1.0, warmup_requests=0)
+        decision = strategy.choose(
+            instances,
+            {
+                "inst-0": context(100, kv_ready_ms=700),
+                "inst-1": context(200, kv_ready_ms=700),
+            },
+        )
+
+        self.assertEqual(decision.candidate_features["inst-0"][2], 0.0)
+        self.assertEqual(decision.candidate_features["inst-1"][2], 0.0)
+
+    def test_shared_model_learns_kv_ready_cost_relation(self) -> None:
+        instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
+        contexts = {
+            "inst-0": context(100, kv_ready_ms=100),
+            "inst-1": context(100, kv_ready_ms=900),
+        }
+        strategy = LinUCBStrategy(alpha=0.0, ridge=1.0, warmup_requests=0)
+        decision = strategy.choose(instances, contexts)
+        for _ in range(8):
+            strategy.update("inst-0", decision.candidate_features["inst-0"], reward=-0.1)
+            strategy.update("inst-1", decision.candidate_features["inst-1"], reward=-0.9)
+
+        self.assertEqual(strategy.choose(instances, contexts).instance_id, "inst-0")
 
     def test_least_inflight_prefers_proxy_local_load_snapshot(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]

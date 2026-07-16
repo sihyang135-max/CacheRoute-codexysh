@@ -1,4 +1,4 @@
-"""Low-overhead disjoint LinUCB for Proxy -> Instance routing."""
+"""Compact load-safe LinUCB for Proxy -> Instance routing."""
 from __future__ import annotations
 
 import math
@@ -20,6 +20,8 @@ class Decision:
     phase: str
     effective_updates: int
     candidate_scores: Dict[str, float]
+    candidate_exploit_scores: Dict[str, float]
+    candidate_exploration_bonuses: Dict[str, float]
     candidate_features: Dict[str, List[float]]
 
 
@@ -31,7 +33,14 @@ def ttft_reward(ttft_ms: float, scale_ms: float, clip: float) -> float:
 
 
 class LinUCBStrategy(BaseInstanceStrategy):
-    """Maintain one linear model per instance arm."""
+    """Learn one shared TTFT model from two action-dependent costs.
+
+    The request path supplies predicted compute and KV-ready costs in
+    milliseconds. They are centered across the current candidates before
+    scoring, so a cost shared by every instance is exactly zero and cannot
+    affect the route. Exploration depends only on per-instance sample count;
+    high load or a slow KV path therefore never earns a larger bonus.
+    """
 
     name = "linucb"
 
@@ -40,145 +49,186 @@ class LinUCBStrategy(BaseInstanceStrategy):
         alpha: float = config.PROXY_RL_ALPHA,
         ridge: float = config.PROXY_RL_LAMBDA,
         warmup_requests: int = config.PROXY_RL_WARMUP_REQUESTS,
+        compute_scale_ms: float = config.PROXY_RL_COMPUTE_COST_SCALE_MS,
+        kv_ready_scale_ms: float = config.PROXY_RL_KV_READY_COST_SCALE_MS,
     ) -> None:
         self.alpha = max(0.0, float(alpha))
         self.ridge = max(1e-6, float(ridge))
-        # Total warm-up budget. Selection keeps arm update counts balanced.
         self.warmup_requests = max(0, int(warmup_requests))
-        self._dim = 7  # bias + six documented state features
-        self._arms: Dict[str, Dict[str, Any]] = {}
+        self.compute_scale_ms = max(1.0, float(compute_scale_ms))
+        self.kv_ready_scale_ms = max(1.0, float(kv_ready_scale_ms))
+        self._feature_names = (
+            "bias",
+            "compute_delta_norm",
+            "kv_ready_delta_norm",
+        )
+        self._dim = len(self._feature_names)
+        self._A_inv = np.eye(self._dim, dtype=float) / self.ridge
+        self._b = np.zeros(self._dim, dtype=float)
+        self._arm_updates: Dict[str, int] = {}
+        self._arm_selections: Dict[str, int] = {}
         self._effective_updates = 0
+        self._effective_selections = 0
         self._tie_cursor = 0
         self._lock = threading.Lock()
 
     @staticmethod
-    def _vector(row: Dict[str, Any]) -> np.ndarray:
-        # Values are normalized by the context builder; clip protects the model
-        # from stale/invalid monitoring input without adding request-path I/O.
-        vals = [
-            1.0,
-            float(row["prompt_norm"]),
-            float(row["kv_norm"]),
-            float(row["prefill_norm"]),
-            float(row["decode_norm"]),
-            float(row["kv_usage"]),
-            float(row["net_norm"]),
-        ]
-        return np.asarray([min(4.0, max(-4.0, v)) for v in vals], dtype=float)
+    def _cost(row: Dict[str, Any], key: str) -> float:
+        value = float(row.get(key, 0.0) or 0.0)
+        return value if math.isfinite(value) and value > 0.0 else 0.0
 
-    def _arm(self, instance_id: str) -> Dict[str, Any]:
-        arm = self._arms.get(instance_id)
-        if arm is None:
-            arm = {
-                "A": np.eye(self._dim, dtype=float) * self.ridge,
-                "b": np.zeros(self._dim, dtype=float),
-                "updates": 0,
-            }
-            self._arms[instance_id] = arm
-        return arm
+    def _candidate_vectors(
+        self,
+        rows: Sequence[tuple[InstanceLike, Dict[str, Any]]],
+    ) -> Dict[str, np.ndarray]:
+        compute = [self._cost(row, "compute_cost_ms") for _, row in rows]
+        kv_ready = [self._cost(row, "kv_ready_cost_ms") for _, row in rows]
+        min_compute = min(compute)
+        min_kv_ready = min(kv_ready)
+        vectors: Dict[str, np.ndarray] = {}
+        for (item, _), compute_ms, kv_ready_ms in zip(rows, compute, kv_ready):
+            vectors[item.instance_id] = np.asarray(
+                [
+                    1.0,
+                    min(4.0, max(0.0, compute_ms - min_compute) / self.compute_scale_ms),
+                    min(4.0, max(0.0, kv_ready_ms - min_kv_ready) / self.kv_ready_scale_ms),
+                ],
+                dtype=float,
+            )
+        return vectors
 
-    def choose(self, instances: Sequence[InstanceLike], contexts: Dict[str, Dict[str, Any]]) -> Decision:
+    def _score(
+        self,
+        instance_id: str,
+        x: np.ndarray,
+        theta: np.ndarray,
+    ) -> tuple[float, float, float]:
+        exploit = float(theta @ x)
+        samples = int(self._arm_updates.get(instance_id, 0))
+        bonus = self.alpha / math.sqrt(self.ridge + samples)
+        return exploit + bonus, exploit, bonus
+
+    def choose(
+        self,
+        instances: Sequence[InstanceLike],
+        contexts: Dict[str, Dict[str, Any]],
+    ) -> Decision:
         if not instances:
             raise RuntimeError("no instances")
-        rows = [(it, contexts.get(it.instance_id)) for it in instances]
-        rows = [(it, row) for it, row in rows if row is not None]
+        rows = [(item, contexts.get(item.instance_id)) for item in instances]
+        rows = [(item, row) for item, row in rows if isinstance(row, dict)]
         if not rows:
             raise RuntimeError("no valid LinUCB contexts")
 
         with self._lock:
             for item, _ in rows:
-                self._arm(item.instance_id)
+                self._arm_updates.setdefault(item.instance_id, 0)
+                self._arm_selections.setdefault(item.instance_id, 0)
+            vectors = self._candidate_vectors(rows)
             candidate_features = {
-                it.instance_id: self._vector(row).tolist()
-                for it, row in rows
+                instance_id: vector.tolist()
+                for instance_id, vector in vectors.items()
             }
+
             if self._effective_updates < self.warmup_requests:
-                minimum_updates = min(
-                    int(self._arm(item.instance_id)["updates"])
-                    for item, _ in rows
+                minimum = min(self._arm_selections[item.instance_id] for item, _ in rows)
+                least_sampled = [
+                    (item, row)
+                    for item, row in rows
+                    if self._arm_selections[item.instance_id] == minimum
+                ]
+                minimum_cost = min(
+                    self._cost(row, "compute_cost_ms")
+                    + self._cost(row, "kv_ready_cost_ms")
+                    for _, row in least_sampled
                 )
-                least_trained = [
-                    pair
-                    for pair in rows
-                    if int(self._arm(pair[0].instance_id)["updates"])
-                    == minimum_updates
-                ]
-                loads = [
-                    float(row.get("prefill_raw", 0))
-                    + float(row.get("decode_raw", 0))
-                    for _, row in least_trained
-                ]
-                minimum_load = min(loads)
                 tied = [
-                    pair
-                    for pair, load in zip(least_trained, loads)
-                    if load == minimum_load
+                    (item, row)
+                    for item, row in least_sampled
+                    if math.isclose(
+                        self._cost(row, "compute_cost_ms")
+                        + self._cost(row, "kv_ready_cost_ms"),
+                        minimum_cost,
+                        abs_tol=1e-9,
+                    )
                 ]
-                it, row = tied[self._tie_cursor % len(tied)]
+                item, _ = tied[self._tie_cursor % len(tied)]
                 self._tie_cursor += 1
+                self._arm_selections[item.instance_id] += 1
+                self._effective_selections += 1
+                zeros = {candidate.instance_id: 0.0 for candidate, _ in rows}
                 return Decision(
-                    instance_id=it.instance_id,
-                    features=candidate_features[it.instance_id],
+                    instance_id=item.instance_id,
+                    features=candidate_features[item.instance_id],
                     score=0.0,
                     phase="warmup",
                     effective_updates=self._effective_updates,
-                    candidate_scores={item.instance_id: 0.0 for item, _ in rows},
+                    candidate_scores=zeros,
+                    candidate_exploit_scores=dict(zeros),
+                    candidate_exploration_bonuses=dict(zeros),
                     candidate_features=candidate_features,
                 )
 
-            candidates: List[Decision] = []
             candidate_scores: Dict[str, float] = {}
-            for it, row in rows:
-                arm = self._arm(it.instance_id)
-                A = arm["A"]
-                b = arm["b"]
-                theta = np.linalg.solve(A, b)
-                inv_A = np.linalg.inv(A)
-                x = self._vector(row)
-                bonus = self.alpha * math.sqrt(max(0.0, float(x @ inv_A @ x)))
-                score = float(theta @ x) + bonus
-                candidate_scores[it.instance_id] = score
-                candidates.append(Decision(
-                    instance_id=it.instance_id,
-                    features=x.tolist(),
-                    score=score,
-                    phase="linucb",
-                    effective_updates=self._effective_updates,
-                    candidate_scores={},
-                    candidate_features=candidate_features,
-                ))
-            maximum = max(candidate.score for candidate in candidates)
-            tied = [
-                candidate
-                for candidate in candidates
-                if math.isclose(candidate.score, maximum, abs_tol=1e-12)
+            candidate_exploit_scores: Dict[str, float] = {}
+            candidate_exploration_bonuses: Dict[str, float] = {}
+            theta = self._A_inv @ self._b
+            # Both learned variables are costs. Confounded samples must not
+            # make a larger predicted delay look beneficial.
+            theta[1:] = np.minimum(theta[1:], 0.0)
+            for item, _ in rows:
+                score, exploit, bonus = self._score(
+                    item.instance_id,
+                    vectors[item.instance_id],
+                    theta,
+                )
+                candidate_scores[item.instance_id] = score
+                candidate_exploit_scores[item.instance_id] = exploit
+                candidate_exploration_bonuses[item.instance_id] = bonus
+
+            maximum = max(candidate_scores.values())
+            tied_ids = [
+                item.instance_id
+                for item, _ in rows
+                if math.isclose(candidate_scores[item.instance_id], maximum, abs_tol=1e-12)
             ]
-            best = tied[self._tie_cursor % len(tied)]
+            chosen_id = tied_ids[self._tie_cursor % len(tied_ids)]
             self._tie_cursor += 1
+            self._arm_selections[chosen_id] += 1
+            self._effective_selections += 1
             return Decision(
-                instance_id=best.instance_id,
-                features=best.features,
-                score=best.score,
-                phase=best.phase,
-                effective_updates=best.effective_updates,
+                instance_id=chosen_id,
+                features=candidate_features[chosen_id],
+                score=candidate_scores[chosen_id],
+                phase="linucb",
+                effective_updates=self._effective_updates,
                 candidate_scores=candidate_scores,
+                candidate_exploit_scores=candidate_exploit_scores,
+                candidate_exploration_bonuses=candidate_exploration_bonuses,
                 candidate_features=candidate_features,
             )
 
     def select(self, instances: List[InstanceLike], hint: Optional[Any] = None) -> InstanceLike:
         contexts = (hint or {}).get("linucb_contexts", {}) if isinstance(hint, dict) else {}
-        chosen = self.choose(instances, contexts)
-        return next(it for it in instances if it.instance_id == chosen.instance_id)
+        decision = self.choose(instances, contexts)
+        return next(item for item in instances if item.instance_id == decision.instance_id)
 
     def update(self, instance_id: str, features: Sequence[float], reward: float) -> None:
         x = np.asarray(features, dtype=float)
         if x.shape != (self._dim,) or not np.all(np.isfinite(x)) or not math.isfinite(float(reward)):
             return
         with self._lock:
-            arm = self._arm(str(instance_id))
-            arm["A"] += np.outer(x, x)
-            arm["b"] += x * float(reward)
-            arm["updates"] = int(arm["updates"]) + 1
+            # Sherman-Morrison keeps the request feedback update O(d^2), with
+            # d=3, and avoids solve/inverse calls in the routing path.
+            projected = self._A_inv @ x
+            denominator = 1.0 + float(x @ projected)
+            if denominator <= 1e-12:
+                return
+            self._A_inv -= np.outer(projected, projected) / denominator
+            self._b += x * float(reward)
+            key = str(instance_id)
+            self._arm_updates[key] = int(self._arm_updates.get(key, 0)) + 1
+            self._arm_selections.setdefault(key, 0)
             self._effective_updates += 1
 
     @property
@@ -187,9 +237,20 @@ class LinUCBStrategy(BaseInstanceStrategy):
             return self._effective_updates
 
     @property
+    def effective_selections(self) -> int:
+        with self._lock:
+            return self._effective_selections
+
+    @property
     def arm_updates(self) -> Dict[str, int]:
         with self._lock:
-            return {
-                instance_id: int(arm["updates"])
-                for instance_id, arm in self._arms.items()
-            }
+            return dict(self._arm_updates)
+
+    @property
+    def arm_selections(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._arm_selections)
+
+    @property
+    def feature_names(self) -> List[str]:
+        return list(self._feature_names)

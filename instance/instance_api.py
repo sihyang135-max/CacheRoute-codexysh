@@ -20,7 +20,7 @@ import os
 import asyncio
 import json
 import subprocess
-# import time
+import time
 
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
@@ -46,6 +46,7 @@ INSTANCE_ID = os.environ.get("INSTANCE_ID", f"hp_{INSTANCE_ADVERTISE_HOST}:{INST
 vllm_base_url = os.environ.get("VLLM_BASE_URL", config.VLLM_BASE_URL).rstrip("/")
 use_mock = True if config.USE_MOCK else False
 VLLM_METRICS_URL = os.environ.get("VLLM_METRICS_URL", f"{vllm_base_url}/metrics").rstrip("/")
+_NET_SAMPLES: Dict[str, Tuple[float, int, int]] = {}
 
 
 def _norm_http_base(raw: str) -> str:
@@ -86,6 +87,42 @@ def _read_iface_speed_mbps(iface: str) -> Optional[float]:
         return None
 
 
+def _read_iface_counters(iface: str) -> Optional[Tuple[int, int]]:
+    if not iface:
+        return None
+    try:
+        with open("/proc/net/dev", "r", encoding="utf-8") as stream:
+            for raw in stream:
+                if ":" not in raw:
+                    continue
+                name, values = raw.split(":", 1)
+                if name.strip() != iface:
+                    continue
+                fields = values.split()
+                return int(fields[0]), int(fields[8])
+    except Exception:
+        return None
+    return None
+
+
+def _available_bandwidth_mbps(iface: str, capacity_mbps: float) -> Tuple[float, float, float]:
+    """Estimate current headroom from background interface counters."""
+    now_s = time.monotonic()
+    counters = _read_iface_counters(iface)
+    if counters is None:
+        return float(capacity_mbps), 0.0, 0.0
+    rx_bytes, tx_bytes = counters
+    previous = _NET_SAMPLES.get(iface)
+    _NET_SAMPLES[iface] = (now_s, rx_bytes, tx_bytes)
+    if previous is None or now_s <= previous[0]:
+        return float(capacity_mbps), 0.0, 0.0
+    elapsed_s = now_s - previous[0]
+    rx_mbps = max(0.0, rx_bytes - previous[1]) * 8.0 / (elapsed_s * 1_000_000.0)
+    tx_mbps = max(0.0, tx_bytes - previous[2]) * 8.0 / (elapsed_s * 1_000_000.0)
+    available = max(1.0, float(capacity_mbps) - max(rx_mbps, tx_mbps))
+    return available, rx_mbps, tx_mbps
+
+
 async def _probe_kdn_link(client: ProxyControlClient, instance_id: str, target: str, logger: logging.Logger) -> Optional[Tuple[str, Dict[str, Any]]]:
     base = _norm_http_base(target)
     if not base:
@@ -123,15 +160,23 @@ async def _probe_kdn_link(client: ProxyControlClient, instance_id: str, target: 
         latency_ms = sum(rtts) / len(rtts) if rtts else 0.0
 
     iface = _discover_iface_for_host(host) or ""
-    bw = _read_iface_speed_mbps(iface)
-    if bw is None:
-        bw = float(os.environ.get("INSTANCE_DEFAULT_LINK_BW_MBPS", str(getattr(config, "INSTANCE_DEFAULT_LINK_BW_MBPS", 1000.0))) or 1000.0)
+    capacity_mbps = _read_iface_speed_mbps(iface)
+    if capacity_mbps is None:
+        capacity_mbps = float(os.environ.get("INSTANCE_DEFAULT_LINK_BW_MBPS", str(getattr(config, "INSTANCE_DEFAULT_LINK_BW_MBPS", 1000.0))) or 1000.0)
+    available_mbps, rx_mbps, tx_mbps = _available_bandwidth_mbps(
+        iface,
+        capacity_mbps,
+    )
     kdn_id = str(hj.get("kdn_id") or f"kdn://{host}:{port}")
     metrics = {
-        "bandwidth_mbps": round(float(bw), 3),
+        "bandwidth_mbps": round(float(available_mbps), 3),
+        "capacity_mbps": round(float(capacity_mbps), 3),
+        "rx_mbps": round(float(rx_mbps), 3),
+        "tx_mbps": round(float(tx_mbps), 3),
         "latency_ms": round(float(latency_ms), 3),
         "iface": iface or None,
         "measured_by": instance_id,
+        "observed_at_s": time.time(),
     }
     return kdn_id, metrics
 
@@ -194,7 +239,14 @@ async def lifespan(app: FastAPI):
             host=INSTANCE_ADVERTISE_HOST,
             port=INSTANCE_ADVERTISE_PORT,
             endpoints=["chat/completions", "completions"],
-            meta={"version": "instance_v1", "metrics_url": VLLM_METRICS_URL},
+            meta={
+                "version": "instance_v1",
+                "metrics_url": VLLM_METRICS_URL,
+                "prefill_capacity_ratio": max(
+                    1e-6,
+                    float(os.environ.get("INSTANCE_PREFILL_CAPACITY_RATIO", "1.0") or 1.0),
+                ),
+            },
         )
         runtime_instance_id = reg.instance_id
         interval = float(reg.heartbeat_interval_s) if reg.heartbeat_interval_s else 10.0
@@ -224,9 +276,23 @@ async def lifespan(app: FastAPI):
 
     task = asyncio.create_task(_hb())
     app.state._hb_task = task # type: ignore
-    app.state._topology_task = asyncio.create_task(  # type: ignore
-        _run_topology_discovery(client=client, instance_id=runtime_instance_id, logger=logger)
-    )
+    async def _topology_loop() -> None:
+        interval_s = max(
+            0.5,
+            float(os.environ.get("INSTANCE_TOPOLOGY_INTERVAL_S", "2.0") or 2.0),
+        )
+        while not stop.is_set():
+            await _run_topology_discovery(
+                client=client,
+                instance_id=runtime_instance_id,
+                logger=logger,
+            )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval_s)
+            except asyncio.TimeoutError:
+                pass
+
+    app.state._topology_task = asyncio.create_task(_topology_loop())  # type: ignore
 
     try:
         yield

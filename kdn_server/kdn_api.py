@@ -845,6 +845,9 @@ async def inject_ready_kv(payload: Dict[str, Any]):
     total_keys = 0
     total_payload_bytes = 0
     total_payload_files = 0
+    total_network_queue_ms = 0.0
+    total_network_transfer_ms = 0.0
+    total_network_ms = 0.0
 
     kv_root = str(_get_kv_root_dir())
 
@@ -949,6 +952,9 @@ async def inject_ready_kv(payload: Dict[str, Any]):
             total_keys += int(res.injected)
             total_payload_bytes += int(res.payload_bytes)
             total_payload_files += int(res.payload_files)
+            total_network_queue_ms += float(net_result["network_queue_ms"])
+            total_network_transfer_ms += float(net_result["network_transfer_ms"])
+            total_network_ms += float(net_result["network_total_ms"])
 
             logging.info(
                 "[KDN] inject_ready_kv ok: kid=%s kv_dir=%s injected=%s missing_files=%s "
@@ -992,6 +998,9 @@ async def inject_ready_kv(payload: Dict[str, Any]):
             "keys_injected": total_keys,
             "payload_bytes": total_payload_bytes,
             "payload_files": total_payload_files,
+            "network_queue_ms": round(total_network_queue_ms, 3),
+            "network_transfer_ms": round(total_network_transfer_ms, 3),
+            "network_total_ms": round(total_network_ms, 3),
             "network_sim_enabled": _NETWORK_SIM is not None,
             "detail": "",
         }

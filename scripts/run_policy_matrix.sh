@@ -18,6 +18,7 @@ CONCURRENCIES="${CONCURRENCIES:-1,4,8,16}"
 REPEATS="${REPEATS:-3}"
 REQUESTS="${REQUESTS:-100}"
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-200}"
+ENGINE_WARMUP_REQUESTS_PER_INSTANCE="${ENGINE_WARMUP_REQUESTS_PER_INSTANCE:-2}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
 INJECTION_TYPE="${INJECTION_TYPE:-kvcache}"
 CACHE_PREWARM_COUNT="${CACHE_PREWARM_COUNT:-all}"
@@ -31,9 +32,10 @@ INSTANCE_COUNT="${INSTANCE_COUNT:-4}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 INSTANCE_GPU_GROUPS="${INSTANCE_GPU_GROUPS:-}"
 INSTANCE_TP_SIZES="${INSTANCE_TP_SIZES:-}"
+INSTANCE_PREFILL_CAPACITY_RATIOS="${INSTANCE_PREFILL_CAPACITY_RATIOS:-}"
 
-case "$REPEATS:$REQUESTS:$WARMUP_REQUESTS" in
-  *[!0-9:]*) echo "[FAIL] REPEATS, REQUESTS, and WARMUP_REQUESTS must be integers"; exit 2 ;;
+case "$REPEATS:$REQUESTS:$WARMUP_REQUESTS:$ENGINE_WARMUP_REQUESTS_PER_INSTANCE" in
+  *[!0-9:]*) echo "[FAIL] request and repeat counts must be integers"; exit 2 ;;
 esac
 if [ "$REPEATS" -lt 1 ] || [ "$REQUESTS" -lt 1 ] || [ "$WARMUP_REQUESTS" -lt 1 ]; then
   echo "[FAIL] repeat/request counts must be positive"
@@ -68,6 +70,7 @@ start_stack() {
   TENSOR_PARALLEL_SIZE="$TENSOR_PARALLEL_SIZE" \
   INSTANCE_GPU_GROUPS="$INSTANCE_GPU_GROUPS" \
   INSTANCE_TP_SIZES="$INSTANCE_TP_SIZES" \
+  INSTANCE_PREFILL_CAPACITY_RATIOS="$INSTANCE_PREFILL_CAPACITY_RATIOS" \
   PROXY_INSTANCE_STRATEGY="$strategy" \
   PROXY_RL_ENABLED="$rl_enabled" \
   PROXY_RL_ALPHA="$LINUCB_ALPHA" \
@@ -104,6 +107,21 @@ run_client() {
     --output-jsonl "$output"
 }
 
+warmup_engines() {
+  local output="$1"
+  if [ "$ENGINE_WARMUP_REQUESTS_PER_INSTANCE" -eq 0 ]; then
+    return 0
+  fi
+  docker exec \
+    -e PYTHONPATH="$PROJECT_IN_CONTAINER" \
+    -w "$PROJECT_IN_CONTAINER" \
+    "$CONTAINER" python3 "$PROJECT_IN_CONTAINER/scripts/warmup_vllm_instances.py" \
+    --model "$MODEL_NAME" \
+    --instance-count "$INSTANCE_COUNT" \
+    --requests-per-instance "$ENGINE_WARMUP_REQUESTS_PER_INSTANCE" \
+    --output "$output"
+}
+
 IFS=',' read -r -a strategies <<< "$STRATEGIES"
 IFS=',' read -r -a concurrencies <<< "$CONCURRENCIES"
 
@@ -129,6 +147,7 @@ concurrencies=$CONCURRENCIES
 repeats=$REPEATS
 requests=$REQUESTS
 warmup_requests=$WARMUP_REQUESTS
+engine_warmup_requests_per_instance=$ENGINE_WARMUP_REQUESTS_PER_INSTANCE
 cache_prewarm_count=$CACHE_PREWARM_COUNT
 injection_type=$INJECTION_TYPE
 alpha=$LINUCB_ALPHA
@@ -171,7 +190,9 @@ for concurrency in "${concurrencies[@]}"; do
 
       echo "===== $prefix: restart ====="
       start_stack "$strategy" 0
-      echo "===== $prefix: warm-up ($WARMUP_REQUESTS requests) ====="
+      echo "===== $prefix: direct vLLM engine warm-up ====="
+      warmup_engines "$run_dir/${prefix}-engine-warmup.json"
+      echo "===== $prefix: policy warm-up ($WARMUP_REQUESTS requests) ====="
       run_client "$WARMUP_REQUESTS" "$concurrency" "$seed" "$warmup_file"
       echo "===== $prefix: measure ($REQUESTS requests) ====="
       run_client "$REQUESTS" "$concurrency" "$((seed + 100000))" "$measure_file"

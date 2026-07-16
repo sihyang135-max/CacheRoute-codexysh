@@ -79,6 +79,21 @@ async def get_instance_kdn_link(instance_id: str, kdn_addr: str) -> Dict[str, An
     return {}
 
 
+def get_instance_kdn_link_snapshot(instance_id: str, kdn_addr: str) -> Dict[str, Any]:
+    """Read the latest in-memory topology report without yielding routing."""
+    keys = [str(kdn_addr or "")]
+    if kdn_addr and not str(kdn_addr).startswith("kdn://"):
+        keys.append(f"kdn://{kdn_addr}")
+    if kdn_addr and not str(kdn_addr).startswith("http://"):
+        keys.append(f"http://{kdn_addr}")
+    links = _instance_kdn_links.get(str(instance_id), {})
+    for key in keys:
+        item = links.get(key)
+        if isinstance(item, dict):
+            return dict(item)
+    return {}
+
+
 def _is_better_link(new_item: Dict[str, Any], old_item: Dict[str, Any]) -> bool:
     """
     比较两个 Instance->KDN 链路，返回 new_item 是否更优。

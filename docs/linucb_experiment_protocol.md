@@ -11,7 +11,7 @@
 - 旧 Least-Inflight 依赖可能为空的心跳 `inflight`，平局时会固定选择第一个实例。
 - 单一问题、固定顺序和不配对种子不足以证明上下文在线学习有效。
 
-本阶段先验证一个更窄、但可严谨支撑的命题：**在异构计算能力和动态队列共同存在时，Disjoint LinUCB 能否在线学习请求上下文与实例状态的匹配关系，并改善平均 TTFT 或系统吞吐。**
+本阶段验证的命题是：**在异构计算能力、动态队列和实例级 KV 就绪代价共同存在时，紧凑的二级 contextual bandit 能否在线学习路由代价与 TTFT 的关系，并改善平均 TTFT 或系统吞吐。**
 
 实例级知识驻留是下一阶段命题，必须使用独立 Redis/KV 域后再验证。
 
@@ -36,9 +36,16 @@ EXPECTED_COMMIT=<git_commit> bash scripts/verify_source_sync.sh
 
 ## 3. 已实现的正确性修复
 
-- 使用 Disjoint LinUCB，每个实例维护独立的 `A`、`b` 和更新计数。
-- warmup 按实例已完成更新数均衡分配，避免固定实例冷启动偏置。
+- 使用共享的 3 维模型 `[bias, compute_delta, kv_ready_delta]`；两个代价都先减去候选实例中的最小值，所有实例共有的网络代价严格归零。
+- `compute_delta` 由本地预约时间线、KV 重用后的 residual prefill 和离线标定的实例 prefill capacity 构成。
+- `kv_ready_delta` 由实例级 KV 驻留、KDN 传输排队、后台网卡带宽余量、实际 KV delivery EWMA 和 RTT 构成；请求路径不查询 Prometheus 或远程服务。
+- 当前共享 Redis/KDN 环境使用 `PROXY_RL_KV_RESIDENCY_SCOPE=global` 和 `PROXY_RL_KV_LINK_SCOPE=global`；独立缓存与独立链路实验必须显式改为 `instance`。
+- 探索奖励只依赖实例样本数，不依赖较大的计算或 KV 就绪代价。
+- warmup 按实例已分配请求数均衡，即使反馈延迟也不会偏向某个实例。
+- 每个策略在训练前直接预热全部 vLLM 引擎；这些请求绕过 Proxy，不污染 LinUCB 样本。
 - 从选路到请求完成维护本地 route reservation，并纳入 Least-Inflight 和 LinUCB 队列状态。
+- 状态使用全生命周期 inflight 与 prefill 压力；已知成本特征的系数约束为非正。
+- UCB 探索项只作用于请求上下文，不因候选实例负载高、样本少而奖励拥塞状态。
 - KDN 独占物理传输排队；Proxy 不再重复模拟同一传输等待。
 - KV 注入使用 `SET NX`，区分 cold injection 与 resident hit。
 - TTFT 只在首个 content/reasoning token 到达时记录，不计 role-only 块。
@@ -68,6 +75,7 @@ EXPECTED_COMMIT=<git_commit> bash scripts/verify_source_sync.sh
 export INSTANCE_COUNT=4
 export INSTANCE_GPU_GROUPS='0,1,2,3;4,5;6;7'
 export INSTANCE_TP_SIZES='4,2,1,1'
+export INSTANCE_PREFILL_CAPACITY_RATIOS='<离线标定后归一化的四个值>'
 ```
 
 正式比较 `round_robin`、修正后的 `least_inflight` 和 `linucb`。默认参数先固定为：
@@ -76,6 +84,7 @@ export INSTANCE_TP_SIZES='4,2,1,1'
 export LINUCB_ALPHA=0.05
 export LINUCB_LAMBDA=1.0
 export WARMUP_REQUESTS=200
+export ENGINE_WARMUP_REQUESTS_PER_INSTANCE=2
 export REWARD_SCALE_MS=1000
 export REWARD_CLIP=5
 ```
@@ -93,10 +102,11 @@ INSTANCE_GPU_GROUPS='0,1,2,3;4,5;6;7' \
 INSTANCE_TP_SIZES='4,2,1,1' \
 CONCURRENCIES=1,4,8,16 \
 REPEATS=3 REQUESTS=100 WARMUP_REQUESTS=200 \
+ENGINE_WARMUP_REQUESTS_PER_INSTANCE=2 \
 bash scripts/run_policy_matrix.sh
 ```
 
-矩阵脚本对每个策略单独重启服务栈并执行显式 warmup；同一并发度和重复轮次使用配对种子，策略执行顺序轮换。共享 Redis 只在矩阵开始前统一预热，不能让某个策略单独改变测量条件。
+矩阵脚本对每个策略单独重启服务栈，先直接预热所有 vLLM 引擎，再执行策略 warmup；同一并发度和重复轮次使用配对种子，策略执行顺序轮换。共享 Redis 只在矩阵开始前统一预热，不能让某个策略单独改变测量条件。
 
 先用并发度或 RPS 扫描找出低载、中载和接近饱和三个区域。论文主表至少使用 5 个独立重复；3 次只用于初步诊断。
 
@@ -109,7 +119,7 @@ bash scripts/run_policy_matrix.sh
 - output token/s；
 - success rate。
 
-辅助指标：median/P95 TTFT、wall time、实例选择分布、GPU 利用率、fallback、KV resident hit/transfer 和 LinUCB 更新轨迹。P99 不作为本阶段优越性的主要证据。
+辅助指标：median/P95 TTFT、wall time、实例选择分布、GPU 利用率、fallback、KV resident hit/transfer、`rl_context_build_us`、`rl_bandit_score_us` 和 LinUCB 更新轨迹。P99 不作为本阶段优越性的主要证据；调度开销必须单独报告，不能隐藏在端到端 TTFT 中。
 
 每个负载点报告重复实验的均值、标准差和 95% 置信区间。策略比较使用同一 workload、同一随机种子和同一缓存初始状态。调参种子与最终报告种子必须分离。
 
@@ -126,7 +136,7 @@ LinUCB warmup 是算法成本的一部分：
 - `lambda`: 0.1、1、10；
 - warmup: 0、40、100、200；
 - reward scale: 500、1000、2000 ms；
-- 状态组：仅队列；队列+请求长度；队列+GPU KV 使用率；完整状态；
+- 上下文消融：仅 `compute_delta`；仅 `kv_ready_delta`；完整的两个相对代价；
 - reward：直接 TTFT、裁剪 TTFT、TTFT 加失败惩罚。
 
 若 LinUCB 只在某个偶然参数上获胜，不能形成普适结论。应优先检查状态是否可观测、量纲是否平衡以及环境是否真的存在可学习差异。
@@ -141,7 +151,7 @@ LinUCB warmup 是算法成本的一部分：
 - 热点偏斜、知识块长度、缓存容量和负载突发的组合 workload；
 - 路由后只温热被选实例，从而形成可验证的长期决策影响。
 
-状态中必须加入实例级知识命中/驻留特征。仅调 `alpha` 不能弥补状态缺失。
+实例级知识驻留不再单独增加模型维度，而是通过 `missing_kv_ratio` 改变 KV 就绪代价。网络与知识都相同时，`kv_ready_delta=0`；仅调 `alpha` 不能弥补候选实例之间缺少可学习差异。
 
 ## 9. 进入论文阶段的判据
 

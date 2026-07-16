@@ -10,6 +10,7 @@ INSTANCE_COUNT="${INSTANCE_COUNT:-4}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-2}"
 INSTANCE_GPU_GROUPS="${INSTANCE_GPU_GROUPS:-}"
 INSTANCE_TP_SIZES="${INSTANCE_TP_SIZES:-}"
+INSTANCE_PREFILL_CAPACITY_RATIOS="${INSTANCE_PREFILL_CAPACITY_RATIOS:-}"
 PROXY_INSTANCE_STRATEGY="${PROXY_INSTANCE_STRATEGY:-linucb}"
 PROXY_RL_ENABLED="${PROXY_RL_ENABLED:-1}"
 PROXY_RL_ALPHA="${PROXY_RL_ALPHA:-0.4}"
@@ -17,6 +18,10 @@ PROXY_RL_LAMBDA="${PROXY_RL_LAMBDA:-1.0}"
 PROXY_RL_WARMUP_REQUESTS="${PROXY_RL_WARMUP_REQUESTS:-30}"
 PROXY_RL_REWARD_TTFT_SCALE_MS="${PROXY_RL_REWARD_TTFT_SCALE_MS:-1000.0}"
 PROXY_RL_REWARD_CLIP="${PROXY_RL_REWARD_CLIP:-5.0}"
+PROXY_RL_COMPUTE_COST_SCALE_MS="${PROXY_RL_COMPUTE_COST_SCALE_MS:-1000.0}"
+PROXY_RL_KV_READY_COST_SCALE_MS="${PROXY_RL_KV_READY_COST_SCALE_MS:-1000.0}"
+PROXY_RL_KV_RESIDENCY_SCOPE="${PROXY_RL_KV_RESIDENCY_SCOPE:-global}"
+PROXY_RL_KV_LINK_SCOPE="${PROXY_RL_KV_LINK_SCOPE:-global}"
 
 case "$INSTANCE_COUNT" in
   ''|*[!0-9]*) echo "[FAIL] INSTANCE_COUNT must be a positive integer"; exit 2 ;;
@@ -35,7 +40,21 @@ esac
 
 declare -a gpu_groups=()
 declare -a tp_sizes=()
+declare -a prefill_capacity_ratios=()
 declare -A used_gpus=()
+if [ -n "$INSTANCE_PREFILL_CAPACITY_RATIOS" ]; then
+  IFS=',' read -r -a prefill_capacity_ratios <<< "$INSTANCE_PREFILL_CAPACITY_RATIOS"
+  if [ "${#prefill_capacity_ratios[@]}" -ne "$INSTANCE_COUNT" ]; then
+    echo "[FAIL] INSTANCE_PREFILL_CAPACITY_RATIOS must contain INSTANCE_COUNT entries"
+    exit 2
+  fi
+  for ratio in "${prefill_capacity_ratios[@]}"; do
+    if ! [[ "$ratio" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      echo "[FAIL] invalid prefill capacity ratio: $ratio"
+      exit 2
+    fi
+  done
+fi
 if [ -n "$INSTANCE_GPU_GROUPS" ] || [ -n "$INSTANCE_TP_SIZES" ]; then
   if [ -z "$INSTANCE_GPU_GROUPS" ] || [ -z "$INSTANCE_TP_SIZES" ]; then
     echo "[FAIL] INSTANCE_GPU_GROUPS and INSTANCE_TP_SIZES must be set together"
@@ -161,6 +180,10 @@ export PROXY_RL_LAMBDA
 export PROXY_RL_WARMUP_REQUESTS
 export PROXY_RL_REWARD_TTFT_SCALE_MS
 export PROXY_RL_REWARD_CLIP
+export PROXY_RL_COMPUTE_COST_SCALE_MS
+export PROXY_RL_KV_READY_COST_SCALE_MS
+export PROXY_RL_KV_RESIDENCY_SCOPE
+export PROXY_RL_KV_LINK_SCOPE
 export PROXY_RL_PROMETHEUS_INTERVAL_S=1.0
 export PROXY_RL_PROMETHEUS_TIMEOUT_S=0.2
 export PROXY_RL_PROMETHEUS_STALE_S=3.0
@@ -170,7 +193,9 @@ wait_http http://127.0.0.1:8002/healthz Proxy 120
 
 for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
   vllm_port=$((18000 + idx)); instance_port=$((19001 + idx)); cp_port=$((19101 + idx))
+  prefill_capacity_ratio="${prefill_capacity_ratios[$idx]:-1.0}"
   INSTANCE_ID="inst-${idx}" INSTANCE_CP_PORT="$cp_port" \
+  INSTANCE_PREFILL_CAPACITY_RATIO="$prefill_capacity_ratio" \
   PROXY_CP_URL=http://127.0.0.1:8002 \
   VLLM_BASE_URL="http://127.0.0.1:${vllm_port}" \
   VLLM_METRICS_URL="http://127.0.0.1:${vllm_port}/metrics" \
@@ -187,7 +212,7 @@ if [ "$registered_count" -ne "$INSTANCE_COUNT" ]; then
   exit 1
 fi
 echo "[OK] $INSTANCE_COUNT Instances registered" | tee -a "$LOG_DIR/status.txt"
-echo "[CONFIG] strategy=$PROXY_INSTANCE_STRATEGY rl_enabled=$PROXY_RL_ENABLED alpha=$PROXY_RL_ALPHA lambda=$PROXY_RL_LAMBDA warmup=$PROXY_RL_WARMUP_REQUESTS reward_scale_ms=$PROXY_RL_REWARD_TTFT_SCALE_MS reward_clip=$PROXY_RL_REWARD_CLIP tp_default=$TENSOR_PARALLEL_SIZE gpu_groups=${INSTANCE_GPU_GROUPS:-auto} tp_sizes=${INSTANCE_TP_SIZES:-auto}" | tee -a "$LOG_DIR/status.txt"
+echo "[CONFIG] strategy=$PROXY_INSTANCE_STRATEGY rl_enabled=$PROXY_RL_ENABLED alpha=$PROXY_RL_ALPHA lambda=$PROXY_RL_LAMBDA warmup=$PROXY_RL_WARMUP_REQUESTS reward_scale_ms=$PROXY_RL_REWARD_TTFT_SCALE_MS reward_clip=$PROXY_RL_REWARD_CLIP tp_default=$TENSOR_PARALLEL_SIZE gpu_groups=${INSTANCE_GPU_GROUPS:-auto} tp_sizes=${INSTANCE_TP_SIZES:-auto} prefill_capacity_ratios=${INSTANCE_PREFILL_CAPACITY_RATIOS:-1.0}" | tee -a "$LOG_DIR/status.txt"
 
 # Optional, deliberately explicit: KV building may take a long time.
 if [ "${PREWARM_COUNT:-0}" != "0" ]; then

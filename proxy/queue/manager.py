@@ -80,6 +80,13 @@ class QueueManager:
         self._kdn_kv_active_until_ts_s: Dict[str, float] = {}
         self._kdn_kv_link_locks: Dict[str, asyncio.Lock] = {}
         self._kdn_kv_pending_tasks: Dict[str, List[ProxyTask]] = {}
+        scope = str(getattr(config, "PROXY_RL_KV_RESIDENCY_SCOPE", "global") or "global").strip().lower()
+        self._kv_residency_scope = scope if scope in {"global", "instance"} else "global"
+        link_scope = str(getattr(config, "PROXY_RL_KV_LINK_SCOPE", "global") or "global").strip().lower()
+        self._kv_link_scope = link_scope if link_scope in {"global", "instance"} else "global"
+        self._global_resident_kids: Set[str] = set()
+        self._instance_resident_kids: Dict[str, Set[str]] = {}
+        self._instance_kv_delivery_mbps: Dict[str, float] = {}
         self._instance_cold_start_pending: Dict[str, bool] = {}
         ready_release_policy = os.environ.get("PROXY_READY_RELEASE_POLICY", "ordered").strip().lower()
         if ready_release_policy not in ("ordered", "text_bypass"):
@@ -749,6 +756,77 @@ class QueueManager:
             "ready_queue_size": int(q.ready_q.qsize()),
         }
 
+    def get_compute_wait_snapshot_ms(self, instance_id: str) -> int:
+        """Read the current reservation timeline without request-path I/O."""
+        now_s = time.time()
+        self._ensure_instance_reservation_state(instance_id, now_s=now_s)
+        slot_free = self._instance_slot_free_ts_s[instance_id]
+        slot_ready_s = max(now_s, min(slot_free))
+        prefill_start_s = max(slot_ready_s, self._instance_prefill_free_ts_s[instance_id])
+        return max(0, int((prefill_start_s - now_s) * 1000.0))
+
+    def get_kv_delivery_snapshot(
+        self,
+        instance_id: str,
+        kdn_addr: str,
+        knowledge_ids: List[str],
+    ) -> Dict[str, float]:
+        """Return bounded in-memory inputs maintained by completed KV transfers."""
+        requested = {str(kid).strip().lower() for kid in knowledge_ids if str(kid).strip()}
+        if not requested:
+            missing_ratio = 0.0
+        else:
+            resident = (
+                self._global_resident_kids
+                if self._kv_residency_scope == "global"
+                else self._instance_resident_kids.get(str(instance_id), set())
+            )
+            missing_ratio = len(requested - resident) / float(len(requested))
+        link_key = f"{instance_id}|{str(kdn_addr or '').strip() or 'unknown'}"
+        if self._kv_link_scope == "global":
+            suffix = f"|{str(kdn_addr or '').strip() or 'unknown'}"
+            pending_transfers = sum(
+                len(tasks)
+                for key, tasks in self._kdn_kv_pending_tasks.items()
+                if key.endswith(suffix)
+            )
+        else:
+            pending_transfers = len(self._kdn_kv_pending_tasks.get(link_key, []))
+        return {
+            "missing_ratio": float(missing_ratio),
+            "pending_transfers": float(pending_transfers),
+            "observed_delivery_mbps": float(self._instance_kv_delivery_mbps.get(str(instance_id), 0.0)),
+        }
+
+    def record_kv_delivery(
+        self,
+        instance_id: str,
+        ack: Dict[str, Any],
+        elapsed_ms: float,
+    ) -> None:
+        """Update residency and delivery throughput from an acknowledged transfer."""
+        if not bool(ack.get("ok")):
+            return
+        resident = {
+            str(kid).strip().lower()
+            for kid in (ack.get("injected_kids") or [])
+            if str(kid).strip()
+        }
+        if self._kv_residency_scope == "global":
+            self._global_resident_kids.update(resident)
+        else:
+            self._instance_resident_kids.setdefault(str(instance_id), set()).update(resident)
+
+        payload_bytes = max(0, int(ack.get("payload_bytes", 0) or 0))
+        elapsed_ms = max(0.0, float(elapsed_ms))
+        if payload_bytes <= 0 or elapsed_ms <= 0.0:
+            return
+        observed_mbps = payload_bytes * 8.0 / (1000.0 * elapsed_ms)
+        old = self._instance_kv_delivery_mbps.get(str(instance_id))
+        self._instance_kv_delivery_mbps[str(instance_id)] = (
+            observed_mbps if old is None else (0.8 * old + 0.2 * observed_mbps)
+        )
+
     def ensure_workers_started(self, instance_ids: Optional[list[str]] = None) -> None:
         """
         启动 worker（只启动一次）。
@@ -1029,6 +1107,15 @@ class QueueManager:
                                 )
 
                                 task.kv_ack = kv_ack
+                                self.record_kv_delivery(
+                                    task.instance_id,
+                                    kv_ack,
+                                    elapsed_ms=max(
+                                        0.0,
+                                        float(kv_ack.get("network_transfer_ms", 0.0) or 0.0)
+                                        or (kv_ack_end_ms - kv_ack_start_ms),
+                                    ),
+                                )
                                 logger.info(
                                     "[Prepare] rid=%s kv_ack ok=%s injected=%s text_only=%s miss=%s keys=%s",
                                     task.request_id,

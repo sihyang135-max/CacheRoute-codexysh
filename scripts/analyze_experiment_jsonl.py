@@ -68,6 +68,8 @@ def summarize(path: Path, discard_first: int) -> Dict[str, Any]:
     elapsed_s = max(ends) - min(starts) if starts and ends else None
 
     traces = [row.get("trace") or {} for row in rows]
+    context_build_us = numeric(trace.get("rl_context_build_us") for trace in traces)
+    bandit_score_us = numeric(trace.get("rl_bandit_score_us") for trace in traces)
     selected = Counter(str(trace.get("selected_instance_id") or "missing") for trace in traces)
     phases = Counter(str(trace.get("selection_phase") or "missing") for trace in traces)
     reasons = Counter(str(trace.get("selection_reason") or "missing") for trace in traces)
@@ -99,6 +101,8 @@ def summarize(path: Path, discard_first: int) -> Dict[str, Any]:
         "completion_tokens_total": int(total_tokens) if completion_tokens else None,
         "rl_updated_requests": sum(bool(trace.get("rl_updated")) for trace in traces),
         "rl_scored_requests": sum(trace.get("rl_score_milli") is not None for trace in traces),
+        "rl_context_build_us": stats(context_build_us),
+        "rl_bandit_score_us": stats(bandit_score_us),
         "selected_instances": dict(sorted(selected.items())),
         "selection_phases": dict(sorted(phases.items())),
         "selection_reasons": dict(sorted(reasons.items())),
@@ -114,6 +118,8 @@ def summarize(path: Path, discard_first: int) -> Dict[str, Any]:
             for ack in kv_acks
         ),
         "kv_payload_bytes_total": sum(int(ack.get("payload_bytes") or 0) for ack in kv_acks),
+        "kv_network_queue_ms_total": sum(float(ack.get("network_queue_ms") or 0.0) for ack in kv_acks),
+        "kv_network_transfer_ms_total": sum(float(ack.get("network_transfer_ms") or 0.0) for ack in kv_acks),
         "keys_injected_total": sum(int(ack.get("keys_injected") or 0) for ack in kv_acks),
         "missing_meta_requests": sum(bool(row.get("meta_missing")) for row in rows),
         "trace_warning_requests": sum(bool(row.get("trace_warnings")) for row in rows),
