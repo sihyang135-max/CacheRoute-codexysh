@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import unittest
 from dataclasses import dataclass
 from importlib.util import module_from_spec, spec_from_file_location
@@ -338,6 +339,34 @@ class ClientTTFTTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ControlPortTest(unittest.TestCase):
+    def test_instance_registration_advertises_control_port(self) -> None:
+        tree = ast.parse(
+            (ROOT / "instance" / "instance_api.py").read_text(encoding="utf-8")
+        )
+        registration_meta = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr != "register":
+                continue
+            meta_keyword = next(
+                (keyword for keyword in node.keywords if keyword.arg == "meta"),
+                None,
+            )
+            if meta_keyword is not None and isinstance(meta_keyword.value, ast.Dict):
+                registration_meta.append(meta_keyword.value)
+
+        self.assertEqual(len(registration_meta), 1)
+        meta = registration_meta[0]
+        entries = {
+            key.value: value
+            for key, value in zip(meta.keys, meta.values)
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        self.assertIn("control_port", entries)
+        self.assertIsInstance(entries["control_port"], ast.Name)
+        self.assertEqual(entries["control_port"].id, "cp_port")
+
     def test_task_uses_registered_control_port(self) -> None:
         task = ProxyTask(
             request_id=1,

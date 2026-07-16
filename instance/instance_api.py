@@ -242,6 +242,7 @@ async def lifespan(app: FastAPI):
             meta={
                 "version": "instance_v1",
                 "metrics_url": VLLM_METRICS_URL,
+                "control_port": cp_port,
                 "prefill_capacity_ratio": max(
                     1e-6,
                     float(os.environ.get("INSTANCE_PREFILL_CAPACITY_RATIO", "1.0") or 1.0),
@@ -471,4 +472,3 @@ async def instance_completions(request: FastAPIRequest):
 
     resp_json = await _vllm_text_completion(payload)
     return JSONResponse(content=resp_json)
-
