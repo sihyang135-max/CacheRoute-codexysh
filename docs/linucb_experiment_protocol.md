@@ -36,16 +36,16 @@ EXPECTED_COMMIT=<git_commit> bash scripts/verify_source_sync.sh
 
 ## 3. 已实现的正确性修复
 
-- 使用共享的 3 维模型 `[bias, compute_delta, kv_ready_delta]`；两个代价都先减去候选实例中的最小值，所有实例共有的网络代价严格归零。
+- 每个实例维护独立的标准 LinUCB 模型，使用紧凑 3 维上下文 `[bias, compute_delta, kv_ready_delta]`；两个代价都先减去候选实例中的最小值，所有实例共有的网络代价严格归零。
 - `compute_delta` 由本地预约时间线、KV 重用后的 residual prefill 和离线标定的实例 prefill capacity 构成。
 - `kv_ready_delta` 由实例级 KV 驻留、KDN 传输排队、后台网卡带宽余量、实际 KV delivery EWMA 和 RTT 构成；请求路径不查询 Prometheus 或远程服务。
 - 当前共享 Redis/KDN 环境使用 `PROXY_RL_KV_RESIDENCY_SCOPE=global` 和 `PROXY_RL_KV_LINK_SCOPE=global`；独立缓存与独立链路实验必须显式改为 `instance`。
-- 探索奖励只依赖实例样本数，不依赖较大的计算或 KV 就绪代价。
+- 探索奖励严格使用标准 LinUCB 置信项 `alpha * sqrt(x^T A_a^-1 x)`，不得替换为按实例样本数计算的启发式奖励。
 - warmup 按实例已分配请求数均衡，即使反馈延迟也不会偏向某个实例。
 - 每个策略在训练前直接预热全部 vLLM 引擎；这些请求绕过 Proxy，不污染 LinUCB 样本。
-- 从选路到请求完成维护本地 route reservation，并纳入 Least-Inflight 和 LinUCB 队列状态。
-- 状态使用全生命周期 inflight 与 prefill 压力；已知成本特征的系数约束为非正。
-- UCB 探索项只作用于请求上下文，不因候选实例负载高、样本少而奖励拥塞状态。
+- 从选路到请求完成维护本地 route reservation；Least-Inflight 已使用该计数，LinUCB 的 projected compute wait 仍需补齐对“已选中但尚未进入计算时间线”任务的计入。
+- 计算与 KV 成本通过紧凑上下文输入标准 LinUCB，不对学习系数施加额外符号约束。
+- 每个实例维护独立的 `A_a` 和 `b_a`，按 `A_a <- A_a + xx^T`、`b_a <- b_a + reward*x` 更新；排队保护在上下文构建和候选安全过滤层实现，不修改标准 UCB 公式。
 - KDN 独占物理传输排队；Proxy 不再重复模拟同一传输等待。
 - KV 注入使用 `SET NX`，区分 cold injection 与 resident hit。
 - TTFT 只在首个 content/reasoning token 到达时记录，不计 role-only 块。

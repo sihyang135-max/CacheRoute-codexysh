@@ -1,4 +1,4 @@
-"""Compact load-safe LinUCB for Proxy -> Instance routing."""
+"""Standard disjoint LinUCB with compact routing context."""
 from __future__ import annotations
 
 import math
@@ -33,13 +33,12 @@ def ttft_reward(ttft_ms: float, scale_ms: float, clip: float) -> float:
 
 
 class LinUCBStrategy(BaseInstanceStrategy):
-    """Learn one shared TTFT model from two action-dependent costs.
+    """Run standard disjoint LinUCB on two action-dependent costs.
 
     The request path supplies predicted compute and KV-ready costs in
     milliseconds. They are centered across the current candidates before
-    scoring, so a cost shared by every instance is exactly zero and cannot
-    affect the route. Exploration depends only on per-instance sample count;
-    high load or a slow KV path therefore never earns a larger bonus.
+    scoring, so a cost shared by every instance is exactly zero. Each instance
+    keeps its own linear model and standard context-dependent confidence bound.
     """
 
     name = "linucb"
@@ -63,9 +62,7 @@ class LinUCBStrategy(BaseInstanceStrategy):
             "kv_ready_delta_norm",
         )
         self._dim = len(self._feature_names)
-        self._A_inv = np.eye(self._dim, dtype=float) / self.ridge
-        self._b = np.zeros(self._dim, dtype=float)
-        self._arm_updates: Dict[str, int] = {}
+        self._arms: Dict[str, Dict[str, Any]] = {}
         self._arm_selections: Dict[str, int] = {}
         self._effective_updates = 0
         self._effective_selections = 0
@@ -97,15 +94,28 @@ class LinUCBStrategy(BaseInstanceStrategy):
             )
         return vectors
 
+    def _arm(self, instance_id: str) -> Dict[str, Any]:
+        key = str(instance_id)
+        arm = self._arms.get(key)
+        if arm is None:
+            arm = {
+                "A_inv": np.eye(self._dim, dtype=float) / self.ridge,
+                "b": np.zeros(self._dim, dtype=float),
+                "updates": 0,
+            }
+            self._arms[key] = arm
+        return arm
+
     def _score(
         self,
-        instance_id: str,
         x: np.ndarray,
-        theta: np.ndarray,
+        arm: Dict[str, Any],
     ) -> tuple[float, float, float]:
+        A_inv = arm["A_inv"]
+        theta = A_inv @ arm["b"]
         exploit = float(theta @ x)
-        samples = int(self._arm_updates.get(instance_id, 0))
-        bonus = self.alpha / math.sqrt(self.ridge + samples)
+        uncertainty = max(0.0, float(x @ A_inv @ x))
+        bonus = self.alpha * math.sqrt(uncertainty)
         return exploit + bonus, exploit, bonus
 
     def choose(
@@ -122,7 +132,7 @@ class LinUCBStrategy(BaseInstanceStrategy):
 
         with self._lock:
             for item, _ in rows:
-                self._arm_updates.setdefault(item.instance_id, 0)
+                self._arm(item.instance_id)
                 self._arm_selections.setdefault(item.instance_id, 0)
             vectors = self._candidate_vectors(rows)
             candidate_features = {
@@ -172,15 +182,10 @@ class LinUCBStrategy(BaseInstanceStrategy):
             candidate_scores: Dict[str, float] = {}
             candidate_exploit_scores: Dict[str, float] = {}
             candidate_exploration_bonuses: Dict[str, float] = {}
-            theta = self._A_inv @ self._b
-            # Both learned variables are costs. Confounded samples must not
-            # make a larger predicted delay look beneficial.
-            theta[1:] = np.minimum(theta[1:], 0.0)
             for item, _ in rows:
                 score, exploit, bonus = self._score(
-                    item.instance_id,
                     vectors[item.instance_id],
-                    theta,
+                    self._arm(item.instance_id),
                 )
                 candidate_scores[item.instance_id] = score
                 candidate_exploit_scores[item.instance_id] = exploit
@@ -220,14 +225,15 @@ class LinUCBStrategy(BaseInstanceStrategy):
         with self._lock:
             # Sherman-Morrison keeps the request feedback update O(d^2), with
             # d=3, and avoids solve/inverse calls in the routing path.
-            projected = self._A_inv @ x
+            arm = self._arm(str(instance_id))
+            projected = arm["A_inv"] @ x
             denominator = 1.0 + float(x @ projected)
             if denominator <= 1e-12:
                 return
-            self._A_inv -= np.outer(projected, projected) / denominator
-            self._b += x * float(reward)
+            arm["A_inv"] -= np.outer(projected, projected) / denominator
+            arm["b"] += x * float(reward)
+            arm["updates"] = int(arm["updates"]) + 1
             key = str(instance_id)
-            self._arm_updates[key] = int(self._arm_updates.get(key, 0)) + 1
             self._arm_selections.setdefault(key, 0)
             self._effective_updates += 1
 
@@ -244,7 +250,10 @@ class LinUCBStrategy(BaseInstanceStrategy):
     @property
     def arm_updates(self) -> Dict[str, int]:
         with self._lock:
-            return dict(self._arm_updates)
+            return {
+                instance_id: int(arm["updates"])
+                for instance_id, arm in self._arms.items()
+            }
 
     @property
     def arm_selections(self) -> Dict[str, int]:

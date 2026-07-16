@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 
+import numpy as np
+
 from util.openai_stream import OpenAIStreamObserver
 
 
@@ -130,41 +132,57 @@ class LinUCBObservabilityTest(unittest.TestCase):
         self.assertEqual(strategy.arm_selections, {"inst-0": 2, "inst-1": 2})
         self.assertEqual(strategy.effective_updates, 0)
 
-    def test_higher_cost_cannot_increase_exploit_or_exploration_bonus(self) -> None:
+    def test_standard_ucb_bonus_uses_context_uncertainty(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
         strategy = LinUCBStrategy(alpha=0.2, ridge=1.0, warmup_requests=0)
-        low = {"inst-0": context(100), "inst-1": context(900)}
-        high = {"inst-0": context(900), "inst-1": context(100)}
+        decision = strategy.choose(
+            instances,
+            {"inst-0": context(100), "inst-1": context(900)},
+        )
 
-        for _ in range(4):
-            low_decision = strategy.choose(instances, low)
-            strategy.update("inst-0", low_decision.candidate_features["inst-0"], reward=-0.1)
-            strategy.update("inst-1", low_decision.candidate_features["inst-1"], reward=-0.9)
-
-        low_decision = strategy.choose(instances, low)
-        high_decision = strategy.choose(instances, high)
-
-        self.assertLessEqual(
-            low_decision.candidate_exploit_scores["inst-1"],
-            low_decision.candidate_exploit_scores["inst-0"],
+        self.assertAlmostEqual(
+            decision.candidate_exploration_bonuses["inst-0"],
+            0.2,
         )
         self.assertAlmostEqual(
-            low_decision.candidate_exploration_bonuses["inst-0"],
-            high_decision.candidate_exploration_bonuses["inst-0"],
+            decision.candidate_exploration_bonuses["inst-1"],
+            0.2 * (1.0 + 0.8**2) ** 0.5,
         )
 
-    def test_shared_model_learns_compute_cost_relation(self) -> None:
+    def test_disjoint_models_update_only_the_selected_arm(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
-        contexts = {"inst-0": context(100), "inst-1": context(900)}
+        contexts = {"inst-0": context(100), "inst-1": context(100)}
         strategy = LinUCBStrategy(alpha=0.0, ridge=1.0, warmup_requests=0)
         decision = strategy.choose(instances, contexts)
-        for _ in range(8):
-            strategy.update("inst-0", decision.candidate_features["inst-0"], reward=-0.1)
-            strategy.update("inst-1", decision.candidate_features["inst-1"], reward=-0.9)
+        strategy.update("inst-0", decision.candidate_features["inst-0"], reward=-1.0)
+        after = strategy.choose(instances, contexts)
 
-        self.assertEqual(
-            strategy.choose(instances, contexts).instance_id,
-            "inst-0",
+        self.assertLess(after.candidate_exploit_scores["inst-0"], 0.0)
+        self.assertEqual(after.candidate_exploit_scores["inst-1"], 0.0)
+        self.assertEqual(strategy.arm_updates, {"inst-0": 1, "inst-1": 0})
+
+    def test_standard_disjoint_update_matches_closed_form(self) -> None:
+        instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
+        contexts = {"inst-0": context(100), "inst-1": context(900)}
+        strategy = LinUCBStrategy(alpha=0.3, ridge=1.0, warmup_requests=0)
+        decision = strategy.choose(instances, contexts)
+        x = np.asarray(decision.candidate_features["inst-1"], dtype=float)
+        reward = -0.75
+        strategy.update("inst-1", x, reward=reward)
+
+        expected_A_inv = np.linalg.inv(np.eye(3) + np.outer(x, x))
+        expected_theta = expected_A_inv @ (x * reward)
+        expected_exploit = float(expected_theta @ x)
+        expected_bonus = 0.3 * float(x @ expected_A_inv @ x) ** 0.5
+        after = strategy.choose(instances, contexts)
+
+        self.assertAlmostEqual(
+            after.candidate_exploit_scores["inst-1"],
+            expected_exploit,
+        )
+        self.assertAlmostEqual(
+            after.candidate_exploration_bonuses["inst-1"],
+            expected_bonus,
         )
 
     def test_common_kv_cost_is_removed_from_every_candidate(self) -> None:
@@ -181,7 +199,7 @@ class LinUCBObservabilityTest(unittest.TestCase):
         self.assertEqual(decision.candidate_features["inst-0"][2], 0.0)
         self.assertEqual(decision.candidate_features["inst-1"][2], 0.0)
 
-    def test_shared_model_learns_kv_ready_cost_relation(self) -> None:
+    def test_kv_ready_cost_remains_part_of_compact_context(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
         contexts = {
             "inst-0": context(100, kv_ready_ms=100),
@@ -189,11 +207,9 @@ class LinUCBObservabilityTest(unittest.TestCase):
         }
         strategy = LinUCBStrategy(alpha=0.0, ridge=1.0, warmup_requests=0)
         decision = strategy.choose(instances, contexts)
-        for _ in range(8):
-            strategy.update("inst-0", decision.candidate_features["inst-0"], reward=-0.1)
-            strategy.update("inst-1", decision.candidate_features["inst-1"], reward=-0.9)
 
-        self.assertEqual(strategy.choose(instances, contexts).instance_id, "inst-0")
+        self.assertEqual(decision.candidate_features["inst-0"][2], 0.0)
+        self.assertAlmostEqual(decision.candidate_features["inst-1"][2], 0.8)
 
     def test_least_inflight_prefers_proxy_local_load_snapshot(self) -> None:
         instances = [FakeInstance("inst-0"), FakeInstance("inst-1")]
