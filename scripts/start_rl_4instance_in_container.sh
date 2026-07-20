@@ -104,6 +104,7 @@ export SCHEDULER_EMBEDDING_MODEL="${SCHEDULER_EMBEDDING_MODEL:-/workspace/llm-st
 export KDN_EMBEDDING_MODEL="${KDN_EMBEDDING_MODEL:-$SCHEDULER_EMBEDDING_MODEL}"
 
 LOG_DIR="$PROJECT/log/rl4"
+PID_DIR="$LOG_DIR/pids"
 mkdir -p "$LOG_DIR"
 
 stop_old() {
@@ -117,11 +118,19 @@ stop_old() {
 }
 
 wait_http() {
-  local url="$1"; local name="$2"; local limit="${3:-120}"
+  local url="$1"; local name="$2"; local limit="${3:-120}"; local pid_name="${4:-}"
   for _ in $(seq 1 "$limit"); do
     if curl -fsS "$url" >/dev/null 2>&1; then
       echo "[OK] $name" | tee -a "$LOG_DIR/status.txt"
       return 0
+    fi
+    if [ -n "$pid_name" ] && [ -s "$PID_DIR/$pid_name.pid" ]; then
+      pid="$(cat "$PID_DIR/$pid_name.pid")"
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "[FAIL] $name process exited before becoming ready" | tee -a "$LOG_DIR/status.txt"
+        tail -n 100 "$LOG_DIR/$pid_name.log" >&2 || true
+        return 1
+      fi
     fi
     sleep 1
   done
@@ -130,12 +139,25 @@ wait_http() {
 }
 
 start_bg() {
-  local log="$1"; shift
+  local name="$1" log="$2"; shift 2
   nohup "$@" > "$log" 2>&1 &
+  echo "$!" > "$PID_DIR/$name.pid"
 }
+
+if [ ! -d "$MODEL_DIR" ]; then
+  echo "[FAIL] model directory not found: $MODEL_DIR" >&2
+  exit 2
+fi
+if [ ! -d "$SCHEDULER_EMBEDDING_MODEL" ]; then
+  echo "[FAIL] embedding model directory not found: $SCHEDULER_EMBEDDING_MODEL" >&2
+  exit 2
+fi
+bash "$PROJECT/scripts/verify_source_sync.sh"
 
 stop_old
 : > "$LOG_DIR/status.txt"
+mkdir -p "$PID_DIR"
+find "$PID_DIR" -maxdepth 1 -type f -name '*.pid' -delete
 
 # Default uses equal TP sizes. For TP4/TP2/TP1/TP1, set
 # INSTANCE_GPU_GROUPS='0,1,2,3;4,5;6;7' and INSTANCE_TP_SIZES='4,2,1,1'.
@@ -150,7 +172,8 @@ for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
     tp_size="$TENSOR_PARALLEL_SIZE"
   fi
   vllm_port=$((18000 + idx))
-  CUDA_VISIBLE_DEVICES="$gpu_ids" start_bg "$LOG_DIR/vllm-${idx}.log" \
+  start_bg "vllm-${idx}" "$LOG_DIR/vllm-${idx}.log" env \
+    CUDA_VISIBLE_DEVICES="$gpu_ids" PYTHONUNBUFFERED=1 \
     python3 -m vllm.entrypoints.openai.api_server \
       --model "$MODEL_DIR" --served-model-name "$MODEL_NAME" \
       --host 127.0.0.1 --port "$vllm_port" \
@@ -161,21 +184,24 @@ for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
 done
 
 for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
-  wait_http "http://127.0.0.1:$((18000 + idx))/v1/models" "vLLM-${idx}" 300
+  wait_http "http://127.0.0.1:$((18000 + idx))/v1/models" "vLLM-${idx}" 300 "vllm-${idx}"
   if ! curl -s "http://127.0.0.1:$((18000 + idx))/metrics" | grep -Eq 'kv_cache_usage|gpu_cache_usage'; then
     echo "[WARN] vLLM-${idx}: KVCache Prometheus metric was not found" | tee -a "$LOG_DIR/status.txt"
   fi
 done
 
 cd "$PROJECT/test"
-start_bg "$LOG_DIR/scheduler.log" python3 "$PROJECT/scripts/demo_scheduler_rl.py"
-wait_http http://127.0.0.1:7001/debug/status Scheduler 120
+start_bg scheduler "$LOG_DIR/scheduler.log" env \
+  CUDA_VISIBLE_DEVICES="${SCHEDULER_CUDA_VISIBLE_DEVICES:-}" \
+  PYTHONUNBUFFERED=1 \
+  python3 "$PROJECT/scripts/demo_scheduler_rl.py"
+wait_http http://127.0.0.1:7001/debug/status Scheduler 180 scheduler
 
-start_bg "$LOG_DIR/kdn.log" env \
+start_bg kdn "$LOG_DIR/kdn.log" env \
   CUDA_VISIBLE_DEVICES="${KDN_CUDA_VISIBLE_DEVICES:-}" \
   PYTHONUNBUFFERED=1 \
   python3 demo_kdn.py
-wait_http http://127.0.0.1:9101/v1/topology/ping KDN 120
+wait_http http://127.0.0.1:9101/v1/topology/ping KDN 180 kdn
 
 export PROXY_INSTANCE_STRATEGY
 export PROXY_RL_ENABLED
@@ -192,23 +218,30 @@ export PROXY_RL_PROMETHEUS_INTERVAL_S=1.0
 export PROXY_RL_PROMETHEUS_TIMEOUT_S=0.2
 export PROXY_RL_PROMETHEUS_STALE_S=3.0
 export PROXY_RL_KV_USAGE_LIMIT=0.90
-start_bg "$LOG_DIR/proxy.log" python3 demo_proxy.py --strategy "$PROXY_INSTANCE_STRATEGY" --injection-strategy default
-wait_http http://127.0.0.1:8002/healthz Proxy 120
+start_bg proxy "$LOG_DIR/proxy.log" env PYTHONUNBUFFERED=1 \
+  python3 demo_proxy.py --strategy "$PROXY_INSTANCE_STRATEGY" --injection-strategy default
+wait_http http://127.0.0.1:8002/healthz Proxy 120 proxy
 
 for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
   vllm_port=$((18000 + idx)); instance_port=$((19001 + idx)); cp_port=$((19101 + idx))
   prefill_capacity_ratio="${prefill_capacity_ratios[$idx]:-1.0}"
-  INSTANCE_ID="inst-${idx}" INSTANCE_CP_PORT="$cp_port" \
-  INSTANCE_PREFILL_CAPACITY_RATIO="$prefill_capacity_ratio" \
-  PROXY_CP_URL=http://127.0.0.1:8002 \
-  VLLM_BASE_URL="http://127.0.0.1:${vllm_port}" \
-  VLLM_METRICS_URL="http://127.0.0.1:${vllm_port}/metrics" \
-  INSTANCE_TOPOLOGY_KDN_TARGETS=127.0.0.1:9101 \
-  start_bg "$LOG_DIR/instance-${idx}.log" python3 "$PROJECT/test/demo_instance.py" \
+  start_bg "instance-${idx}" "$LOG_DIR/instance-${idx}.log" env \
+    INSTANCE_ID="inst-${idx}" INSTANCE_CP_PORT="$cp_port" \
+    INSTANCE_PREFILL_CAPACITY_RATIO="$prefill_capacity_ratio" \
+    PROXY_CP_URL=http://127.0.0.1:8002 \
+    VLLM_BASE_URL="http://127.0.0.1:${vllm_port}" \
+    VLLM_METRICS_URL="http://127.0.0.1:${vllm_port}/metrics" \
+    INSTANCE_TOPOLOGY_KDN_TARGETS=127.0.0.1:9101 \
+    PYTHONUNBUFFERED=1 \
+    python3 "$PROJECT/test/demo_instance.py" \
     --host 127.0.0.1 --port "$instance_port" --kdn-targets 127.0.0.1:9101
 done
 
-sleep 5
+for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
+  wait_http "http://127.0.0.1:$((19101 + idx))/healthz" \
+    "Instance-${idx}" 120 "instance-${idx}"
+done
+
 curl -fsS http://127.0.0.1:8002/v1/instance/list > "$LOG_DIR/instances.json"
 registered_count="$(grep -o 'inst-[0-9]\+' "$LOG_DIR/instances.json" | sort -u | wc -l)"
 if [ "$registered_count" -ne "$INSTANCE_COUNT" ]; then
@@ -216,7 +249,7 @@ if [ "$registered_count" -ne "$INSTANCE_COUNT" ]; then
   exit 1
 fi
 echo "[OK] $INSTANCE_COUNT Instances registered" | tee -a "$LOG_DIR/status.txt"
-echo "[CONFIG] strategy=$PROXY_INSTANCE_STRATEGY rl_enabled=$PROXY_RL_ENABLED alpha=$PROXY_RL_ALPHA lambda=$PROXY_RL_LAMBDA warmup=$PROXY_RL_WARMUP_REQUESTS reward_scale_ms=$PROXY_RL_REWARD_TTFT_SCALE_MS reward_clip=$PROXY_RL_REWARD_CLIP tp_default=$TENSOR_PARALLEL_SIZE gpu_groups=${INSTANCE_GPU_GROUPS:-auto} tp_sizes=${INSTANCE_TP_SIZES:-auto} prefill_capacity_ratios=${INSTANCE_PREFILL_CAPACITY_RATIOS:-1.0}" | tee -a "$LOG_DIR/status.txt"
+echo "[CONFIG] commit=${EXPECTED_COMMIT:-unknown} strategy=$PROXY_INSTANCE_STRATEGY rl_enabled=$PROXY_RL_ENABLED alpha=$PROXY_RL_ALPHA lambda=$PROXY_RL_LAMBDA warmup=$PROXY_RL_WARMUP_REQUESTS reward_scale_ms=$PROXY_RL_REWARD_TTFT_SCALE_MS reward_clip=$PROXY_RL_REWARD_CLIP tp_default=$TENSOR_PARALLEL_SIZE gpu_groups=${INSTANCE_GPU_GROUPS:-auto} tp_sizes=${INSTANCE_TP_SIZES:-auto} prefill_capacity_ratios=${INSTANCE_PREFILL_CAPACITY_RATIOS:-1.0} scheduler_cuda=${SCHEDULER_CUDA_VISIBLE_DEVICES:-cpu} kdn_cuda=${KDN_CUDA_VISIBLE_DEVICES:-cpu}" | tee -a "$LOG_DIR/status.txt"
 
 # Optional, deliberately explicit: KV building may take a long time.
 if [ "${PREWARM_COUNT:-0}" != "0" ]; then
@@ -228,5 +261,18 @@ if [ "${PREWARM_COUNT:-0}" != "0" ]; then
     --model "$MODEL_NAME" --redis-host 127.0.0.1 \
     --result-json "$LOG_DIR/kdn_prewarm.json"
 fi
+
+require_kdn_embeddings=0
+if [ "${KDN_BACKFILL_EMBEDDINGS:-0}" = "1" ]; then
+  python3 "$PROJECT/scripts/backfill_kdn_embeddings.py"
+  require_kdn_embeddings=1
+  sleep 35
+fi
+
+PROJECT="$PROJECT" INSTANCE_COUNT="$INSTANCE_COUNT" \
+HEALTH_PASSES="${HEALTH_PASSES:-3}" \
+HEALTH_INTERVAL_S="${HEALTH_INTERVAL_S:-10}" \
+REQUIRE_KDN_EMBEDDINGS="$require_kdn_embeddings" \
+bash "$PROJECT/scripts/check_rl_4instance_health.sh" | tee -a "$LOG_DIR/status.txt"
 
 echo "[DONE] $PROXY_INSTANCE_STRATEGY $INSTANCE_COUNT-Instance environment is ready" | tee -a "$LOG_DIR/status.txt"

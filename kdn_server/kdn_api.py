@@ -287,9 +287,11 @@ async def _startup():
             print("[KDN] embedding model loaded successfully")
         except Exception as e:
             print(f"[KDN] failed to load embedding model: {e}")
-            embedder = None
+            raise RuntimeError(
+                f"KDN embedding model failed to load: {embedding_model}"
+            ) from e
     else:
-        print("[KDN] KDN_EMBEDDING_MODEL not set")
+        raise RuntimeError("KDN_EMBEDDING_MODEL is required")
 
     _TEXT_DB = TextDatabase(str(db_dir), embedder=embedder)
     print(f"[KDN] TextDatabase ready: {db_dir}")

@@ -249,7 +249,9 @@ async def lifespan(app: FastAPI):
 
     except Exception as e:
         logger.exception(f"[Scheduler] 预热 Embedding 模型失败: {e}")
-        app.state.embedding_engine = None  # type: ignore
+        raise RuntimeError(
+            f"Scheduler embedding model failed to load: {embedding_model_name}"
+        ) from e
 
     # -------------------------------------------------------------
     # 尝试启动控制平面，启用proxy池和KDN池，并从KDN池拉取知识清单来初始化知识库

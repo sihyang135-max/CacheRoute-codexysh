@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 EXPECTED_COMMIT="${EXPECTED_COMMIT:-}"
+REQUIRE_CLEAN_WORKTREE="${REQUIRE_CLEAN_WORKTREE:-0}"
 MANIFEST="${SOURCE_MANIFEST:-$ROOT/env/experiment_source.sha256}"
 
 cd "$ROOT"
@@ -18,6 +19,10 @@ if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/n
   if [ -n "$(git status --porcelain)" ]; then
     echo "[WARN] git worktree is not clean"
     git status --short
+    if [ "$REQUIRE_CLEAN_WORKTREE" = "1" ]; then
+      echo "[FAIL] clean worktree is required for this experiment" >&2
+      exit 2
+    fi
   else
     echo "[OK] git worktree is clean"
   fi
