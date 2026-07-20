@@ -171,7 +171,10 @@ cd "$PROJECT/test"
 start_bg "$LOG_DIR/scheduler.log" python3 "$PROJECT/scripts/demo_scheduler_rl.py"
 wait_http http://127.0.0.1:7001/debug/status Scheduler 120
 
-start_bg "$LOG_DIR/kdn.log" python3 demo_kdn.py
+start_bg "$LOG_DIR/kdn.log" env \
+  CUDA_VISIBLE_DEVICES="${KDN_CUDA_VISIBLE_DEVICES:-}" \
+  PYTHONUNBUFFERED=1 \
+  python3 demo_kdn.py
 wait_http http://127.0.0.1:9101/v1/topology/ping KDN 120
 
 export PROXY_INSTANCE_STRATEGY

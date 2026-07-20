@@ -49,6 +49,7 @@ docker exec -e MODEL_DIR="$MODEL_DIR" -e MODEL_NAME="$MODEL_NAME" \
   -e PROXY_RL_KV_LINK_SCOPE="${PROXY_RL_KV_LINK_SCOPE:-global}" \
   -e SCHEDULER_EMBEDDING_MODEL="${SCHEDULER_EMBEDDING_MODEL:-/workspace/llm-stack/models/intfloat/multilingual-e5-large-instruct}" \
   -e KDN_EMBEDDING_MODEL="${KDN_EMBEDDING_MODEL:-${SCHEDULER_EMBEDDING_MODEL:-/workspace/llm-stack/models/intfloat/multilingual-e5-large-instruct}}" \
+  -e KDN_CUDA_VISIBLE_DEVICES="${KDN_CUDA_VISIBLE_DEVICES:-}" \
   -e LMCACHE_CONFIG_FILE="${LMCACHE_CONFIG_FILE:-/workspace/llm-stack/config/lmcache_with_redis.yaml}" \
   "$CONTAINER" bash "$PROJECT_IN_CONTAINER/scripts/start_rl_4instance_in_container.sh"
 
