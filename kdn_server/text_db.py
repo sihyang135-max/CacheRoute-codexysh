@@ -114,6 +114,17 @@ class TextDatabase:
         final_path = self.base_dir / rel_path
         length = len(norm)
         meta_json = json.dumps(meta or {}, ensure_ascii=False)
+        # 先尝试查索引，命中则直接返回（幂等）
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT embedding, embed_dim FROM knowledge_blocks WHERE kid = ?",
+                (kid,),
+            ).fetchone()
+            if row and row["embedding"] is not None and row["embed_dim"] is not None:
+                return kid, "exists", length
+            if row and self._embedder is None:
+                return kid, "exists", length
+
         embedding_blob = None
         embed_dim = None
         if self._embedder is not None:
@@ -122,11 +133,17 @@ class TextDatabase:
             embedding_blob = vec.tobytes()
             embed_dim = int(vec.shape[0])
 
-        # 先尝试查索引，命中则直接返回（幂等）
-        with self._connect() as conn:
-            row = conn.execute("SELECT kid FROM knowledge_blocks WHERE kid = ?", (kid,)).fetchone()
-            if row:
-                return kid, "exists", length
+        if row:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE knowledge_blocks
+                    SET embedding = ?, embed_dim = ?
+                    WHERE kid = ? AND (embedding IS NULL OR embed_dim IS NULL)
+                    """,
+                    (embedding_blob, embed_dim, kid),
+                )
+            return kid, "exists", length
 
         # 原子写文件：tmp -> replace
         tmp_dir = self.base_dir / "tmp"

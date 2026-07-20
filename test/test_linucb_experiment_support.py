@@ -13,6 +13,7 @@ import time
 import numpy as np
 
 from util.openai_stream import OpenAIStreamObserver
+from kdn_server.text_db import TextDatabase
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -226,6 +227,36 @@ class LinUCBObservabilityTest(unittest.TestCase):
 
         self.assertEqual(strategy.select(instances, hint).instance_id, "inst-0")
         self.assertEqual(strategy.select(instances, hint).instance_id, "inst-1")
+
+
+class TextDatabaseEmbeddingRepairTest(unittest.TestCase):
+    class FakeEmbedder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def encode_vector(self, content: str):
+            self.calls += 1
+            return [np.asarray([1.0, 2.0, 3.0], dtype=np.float32)]
+
+    def test_existing_row_without_embedding_is_backfilled(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            plain_db = TextDatabase(temp_dir)
+            kid, status, _ = plain_db.register_text("repair me")
+            self.assertEqual(status, "created")
+            self.assertIsNone(plain_db.get_many([kid])[0][0].embedding)
+
+            embedder = self.FakeEmbedder()
+            repaired_db = TextDatabase(temp_dir, embedder=embedder)
+            _, status, _ = repaired_db.register_text("repair me")
+            item = repaired_db.get_many([kid])[0][0]
+
+            self.assertEqual(status, "exists")
+            self.assertEqual(embedder.calls, 1)
+            self.assertEqual(item.embed_dim, 3)
+            self.assertEqual(item.embedding, [1.0, 2.0, 3.0])
+
+            repaired_db.register_text("repair me")
+            self.assertEqual(embedder.calls, 1)
 
 
 class KVResidencyTest(unittest.TestCase):

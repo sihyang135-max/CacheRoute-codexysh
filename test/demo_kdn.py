@@ -65,8 +65,13 @@ if __name__ == "__main__":
     # 这里暴露配置（你想要的“demo里配置，不在模块里写死”）
     os.environ["KDN_TEXT_DB_DIR"] = str(KDN_TEXT_DB_DIR)
     os.environ["KDN_KV_DB_DIR"] = str(KDN_KV_DB_DIR)
-    os.environ[
-        "KDN_EMBEDDING_MODEL"] = "/workspace/llm-stack/CacheRoute/model/embedder/intfloat__multilingual-e5-large-instruct"
+    os.environ.setdefault(
+        "KDN_EMBEDDING_MODEL",
+        os.environ.get(
+            "SCHEDULER_EMBEDDING_MODEL",
+            "/workspace/llm-stack/models/intfloat/multilingual-e5-large-instruct",
+        ),
+    )
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
