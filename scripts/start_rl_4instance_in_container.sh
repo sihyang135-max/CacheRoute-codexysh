@@ -107,14 +107,45 @@ LOG_DIR="$PROJECT/log/rl4"
 PID_DIR="$LOG_DIR/pids"
 mkdir -p "$LOG_DIR"
 
+stop_pid_groups() {
+  [ -d "$PID_DIR" ] || return 0
+  for pid_file in "$PID_DIR"/*.pid; do
+    [ -s "$pid_file" ] || continue
+    pid="$(cat "$pid_file")"
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  done
+}
+
+vllm_processes_exist() {
+  pgrep -f 'vllm.entrypoints.openai.api_server|vllm.v1.engine|EngineCore|WorkerProc' \
+    >/dev/null 2>&1
+}
+
 stop_old() {
-  pkill -f 'vllm.entrypoints.openai.api_server' || true
-  pkill -f 'demo_instance.py' || true
-  pkill -f 'demo_proxy.py' || true
-  pkill -f 'demo_kdn.py' || true
-  pkill -f 'demo_scheduler.py' || true
-  pkill -f 'demo_scheduler_rl.py' || true
-  sleep 2
+  stop_pid_groups
+  pkill -TERM -f 'vllm.entrypoints.openai.api_server|vllm.v1.engine|EngineCore|WorkerProc' || true
+  pkill -TERM -f 'demo_instance.py' || true
+  pkill -TERM -f 'demo_proxy.py' || true
+  pkill -TERM -f 'demo_kdn.py' || true
+  pkill -TERM -f 'demo_scheduler.py' || true
+  pkill -TERM -f 'demo_scheduler_rl.py' || true
+
+  for _ in $(seq 1 60); do
+    if ! vllm_processes_exist; then
+      break
+    fi
+    sleep 1
+  done
+  if vllm_processes_exist; then
+    echo "[WARN] forcing stale vLLM processes to exit" >&2
+    pkill -KILL -f 'vllm.entrypoints.openai.api_server|vllm.v1.engine|EngineCore|WorkerProc' || true
+    sleep 2
+  fi
+  if vllm_processes_exist; then
+    echo "[FAIL] stale vLLM processes remain after cleanup" >&2
+    pgrep -af 'vllm.entrypoints.openai.api_server|vllm.v1.engine|EngineCore|WorkerProc' >&2 || true
+    return 1
+  fi
 }
 
 wait_http() {
@@ -140,9 +171,21 @@ wait_http() {
 
 start_bg() {
   local name="$1" log="$2"; shift 2
-  nohup "$@" > "$log" 2>&1 &
+  nohup setsid "$@" > "$log" 2>&1 &
   echo "$!" > "$PID_DIR/$name.pid"
 }
+
+startup_complete=0
+cleanup_on_exit() {
+  rc=$?
+  trap - EXIT
+  if [ "$rc" -ne 0 ] && [ "$startup_complete" -ne 1 ]; then
+    echo "[CLEANUP] startup failed; stopping partial stack" >&2
+    stop_old || true
+  fi
+  exit "$rc"
+}
+trap cleanup_on_exit EXIT
 
 if [ ! -d "$MODEL_DIR" ]; then
   echo "[FAIL] model directory not found: $MODEL_DIR" >&2
@@ -275,3 +318,4 @@ REQUIRE_KDN_EMBEDDINGS="$require_kdn_embeddings" \
 bash "$PROJECT/scripts/check_rl_4instance_health.sh" | tee -a "$LOG_DIR/status.txt"
 
 echo "[DONE] $PROXY_INSTANCE_STRATEGY $INSTANCE_COUNT-Instance environment is ready" | tee -a "$LOG_DIR/status.txt"
+startup_complete=1

@@ -259,6 +259,19 @@ class TextDatabaseEmbeddingRepairTest(unittest.TestCase):
             self.assertEqual(embedder.calls, 1)
 
 
+class ExperimentLauncherSafetyTest(unittest.TestCase):
+    def test_launcher_tracks_process_groups_and_cleans_partial_startup(self) -> None:
+        source = (ROOT / "scripts" / "start_rl_4instance_in_container.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('nohup setsid "$@"', source)
+        self.assertIn('kill -TERM -- "-$pid"', source)
+        self.assertIn("trap cleanup_on_exit EXIT", source)
+        self.assertIn("startup failed; stopping partial stack", source)
+        self.assertIn("stale vLLM processes remain after cleanup", source)
+
+
 class KVResidencyTest(unittest.TestCase):
     class FakePipeline:
         def __init__(self, values: dict[bytes, bytes]) -> None:
