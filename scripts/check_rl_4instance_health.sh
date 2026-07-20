@@ -6,6 +6,7 @@ INSTANCE_COUNT="${INSTANCE_COUNT:-4}"
 HEALTH_PASSES="${HEALTH_PASSES:-3}"
 HEALTH_INTERVAL_S="${HEALTH_INTERVAL_S:-10}"
 REQUIRE_KDN_EMBEDDINGS="${REQUIRE_KDN_EMBEDDINGS:-0}"
+KNOWLEDGE_READY_TIMEOUT_S="${KNOWLEDGE_READY_TIMEOUT_S:-180}"
 PID_DIR="$PROJECT/log/rl4/pids"
 LOG_DIR="$PROJECT/log/rl4"
 
@@ -42,13 +43,13 @@ check_registered_instances() {
   fi
 }
 
-check_knowledge() {
-  local kdn scheduler
-  if ! kdn="$(curl -fsS --max-time 10 -X POST \
+knowledge_is_ready() {
+  LAST_KDN_STATUS=""
+  LAST_SCHEDULER_STATUS=""
+  if ! LAST_KDN_STATUS="$(curl -fsS --max-time 10 -X POST \
       http://127.0.0.1:9101/knowledge/pool_status \
       -H 'Content-Type: application/json' -d '{"sample_limit":0}')"; then
-    failures+=("KDN pool status unavailable")
-    return
+    return 1
   fi
   if ! python3 -c '
 import json,sys
@@ -56,13 +57,12 @@ x=json.load(sys.stdin)
 total=int(x.get("total_blocks") or 0)
 ready=int(x.get("embedding_ready_blocks") or 0)
 raise SystemExit(0 if total > 0 and ready == total else 1)
-' <<<"$kdn"; then
-    failures+=("KDN embeddings are not fully ready")
+' <<<"$LAST_KDN_STATUS"; then
+    return 1
   fi
 
-  if ! scheduler="$(curl -fsS --max-time 10 http://127.0.0.1:7001/debug/status)"; then
-    failures+=("scheduler debug status unavailable")
-    return
+  if ! LAST_SCHEDULER_STATUS="$(curl -fsS --max-time 10 http://127.0.0.1:7001/debug/status)"; then
+    return 1
   fi
   if ! python3 -c '
 import json,sys
@@ -71,7 +71,14 @@ ok=(x.get("knowledge_loaded") is True and int(x.get("entries") or 0) > 0 and
     int(x.get("faiss_total") or 0) == int(x.get("entries") or 0) and
     x.get("kdn_last_refresh_ok") is True)
 raise SystemExit(0 if ok else 1)
-' <<<"$scheduler"; then
+' <<<"$LAST_SCHEDULER_STATUS"; then
+    return 1
+  fi
+  return 0
+}
+
+check_knowledge() {
+  if ! knowledge_is_ready; then
     failures+=("scheduler knowledge index is not ready")
   fi
 }
@@ -86,6 +93,24 @@ dump_failures() {
     tail -n 30 "$log" >&2 || true
   done
 }
+
+if [ "$REQUIRE_KDN_EMBEDDINGS" = "1" ]; then
+  knowledge_ready=0
+  for _ in $(seq 1 "$KNOWLEDGE_READY_TIMEOUT_S"); do
+    if knowledge_is_ready; then
+      knowledge_ready=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$knowledge_ready" -ne 1 ]; then
+    echo "[FAIL] knowledge index did not become ready within ${KNOWLEDGE_READY_TIMEOUT_S}s" >&2
+    echo "KDN status: ${LAST_KDN_STATUS:-unavailable}" >&2
+    echo "Scheduler status: ${LAST_SCHEDULER_STATUS:-unavailable}" >&2
+    exit 1
+  fi
+  echo "[OK] KDN embeddings and Scheduler FAISS index are ready"
+fi
 
 for pass in $(seq 1 "$HEALTH_PASSES"); do
   failures=()

@@ -266,7 +266,6 @@ require_kdn_embeddings=0
 if [ "${KDN_BACKFILL_EMBEDDINGS:-0}" = "1" ]; then
   python3 "$PROJECT/scripts/backfill_kdn_embeddings.py"
   require_kdn_embeddings=1
-  sleep 35
 fi
 
 PROJECT="$PROJECT" INSTANCE_COUNT="$INSTANCE_COUNT" \
