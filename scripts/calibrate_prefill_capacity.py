@@ -9,6 +9,7 @@ import math
 import random
 import statistics
 import time
+from concurrent.futures import Executor, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
@@ -80,6 +81,7 @@ def request_once(
         method="POST",
     )
 
+    started_at_unix_ns = time.time_ns()
     started = time.perf_counter()
     ttft_ms = None
     first_chunk_ms = None
@@ -131,6 +133,7 @@ def request_once(
         "tp": tp,
         "request_index": request_index,
         "prompt_index": prompt_index,
+        "request_started_at_unix_ns": started_at_unix_ns,
         "status_code": status_code,
         "success": success,
         "ttft_ms": round(ttft_ms, 3) if ttft_ms is not None else None,
@@ -140,6 +143,15 @@ def request_once(
         "completion_tokens": completion_tokens,
         "error": error,
     }
+
+
+def run_request_batch(
+    executor: Executor,
+    jobs: Sequence[Dict[str, Any]],
+    request_fn=request_once,
+) -> List[Dict[str, Any]]:
+    futures = [executor.submit(request_fn, **job) for job in jobs]
+    return [future.result() for future in futures]
 
 
 def summarize(records: Iterable[Dict[str, Any]], ports: Sequence[int]) -> Dict[str, Any]:
@@ -244,7 +256,10 @@ def main() -> None:
     records: List[Dict[str, Any]] = []
     request_index = 0
     prompt_index = 0
-    with records_path.open("w", encoding="utf-8") as output:
+    with (
+        records_path.open("w", encoding="utf-8") as output,
+        ThreadPoolExecutor(max_workers=len(ports)) as executor,
+    ):
         for label, prompt_repetitions in zip(labels, repetitions):
             for phase, count in (
                 ("warmup", args.warmup_per_instance),
@@ -253,24 +268,26 @@ def main() -> None:
                 for _ in range(count):
                     order = list(range(len(ports)))
                     rng.shuffle(order)
+                    jobs = []
                     for instance_index in order:
-                        record = request_once(
-                            run_id=args.run_id,
-                            phase=phase,
-                            length_label=label,
-                            prompt_repetitions=prompt_repetitions,
-                            port=ports[instance_index],
-                            tp=tp_sizes[instance_index],
-                            request_index=request_index,
-                            prompt_index=prompt_index,
-                            model=args.model,
-                            timeout_s=args.timeout_s,
-                        )
+                        jobs.append({
+                            "run_id": args.run_id,
+                            "phase": phase,
+                            "length_label": label,
+                            "prompt_repetitions": prompt_repetitions,
+                            "port": ports[instance_index],
+                            "tp": tp_sizes[instance_index],
+                            "request_index": request_index,
+                            "prompt_index": prompt_index,
+                            "model": args.model,
+                            "timeout_s": args.timeout_s,
+                        })
+                        request_index += 1
+                    for record in run_request_batch(executor, jobs):
                         records.append(record)
                         output.write(json.dumps(record, ensure_ascii=False) + "\n")
                         output.flush()
                         print(json.dumps(record, ensure_ascii=False), flush=True)
-                        request_index += 1
                     prompt_index += 1
 
     for port in ports:
@@ -289,6 +306,7 @@ def main() -> None:
         "prompt_repetitions": repetitions,
         "warmup_per_instance": args.warmup_per_instance,
         "measured_per_instance": args.measured_per_instance,
+        "parallel_instances_per_prompt": len(ports),
         "seed": args.seed,
         "total_requests": len(records),
         "failures": len(failures),

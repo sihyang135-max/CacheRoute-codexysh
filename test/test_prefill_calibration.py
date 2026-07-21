@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 from scripts.calibrate_prefill_capacity import (
     build_prompt,
     percentile_nearest_rank,
+    run_request_batch,
     summarize,
 )
 
@@ -23,6 +26,19 @@ class PrefillCalibrationTest(unittest.TestCase):
         second = build_prompt("run-1", "medium", 7, 3)
 
         self.assertEqual(first, second)
+
+    def test_request_batch_starts_all_instances_concurrently(self) -> None:
+        barrier = Barrier(4, timeout=1.0)
+
+        def fake_request(**job):
+            barrier.wait()
+            return job
+
+        jobs = [{"port": port} for port in (18000, 18001, 18002, 18003)]
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = run_request_batch(executor, jobs, request_fn=fake_request)
+
+        self.assertEqual({row["port"] for row in results}, {18000, 18001, 18002, 18003})
 
     def test_nearest_rank_percentile(self) -> None:
         self.assertEqual(percentile_nearest_rank([1, 2, 3, 4], 0.95), 4.0)
