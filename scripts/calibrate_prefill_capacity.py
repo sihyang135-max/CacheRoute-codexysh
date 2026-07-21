@@ -58,10 +58,11 @@ def request_once(
     port: int,
     tp: int,
     request_index: int,
+    prompt_index: int,
     model: str,
     timeout_s: float,
 ) -> Dict[str, Any]:
-    prompt = build_prompt(run_id, length_label, request_index, prompt_repetitions)
+    prompt = build_prompt(run_id, length_label, prompt_index, prompt_repetitions)
     payload = json.dumps(
         {
             "model": model,
@@ -129,6 +130,7 @@ def request_once(
         "port": port,
         "tp": tp,
         "request_index": request_index,
+        "prompt_index": prompt_index,
         "status_code": status_code,
         "success": success,
         "ttft_ms": round(ttft_ms, 3) if ttft_ms is not None else None,
@@ -241,6 +243,7 @@ def main() -> None:
     rng = random.Random(args.seed)
     records: List[Dict[str, Any]] = []
     request_index = 0
+    prompt_index = 0
     with records_path.open("w", encoding="utf-8") as output:
         for label, prompt_repetitions in zip(labels, repetitions):
             for phase, count in (
@@ -259,6 +262,7 @@ def main() -> None:
                             port=ports[instance_index],
                             tp=tp_sizes[instance_index],
                             request_index=request_index,
+                            prompt_index=prompt_index,
                             model=args.model,
                             timeout_s=args.timeout_s,
                         )
@@ -267,6 +271,7 @@ def main() -> None:
                         output.flush()
                         print(json.dumps(record, ensure_ascii=False), flush=True)
                         request_index += 1
+                    prompt_index += 1
 
     for port in ports:
         check_vllm(port, args.timeout_s)

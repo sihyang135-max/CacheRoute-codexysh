@@ -18,6 +18,12 @@ class PrefillCalibrationTest(unittest.TestCase):
         self.assertEqual(first.count(" a"), 3)
         self.assertNotEqual(first.splitlines()[0], second.splitlines()[0])
 
+    def test_same_prompt_index_produces_the_same_prompt(self) -> None:
+        first = build_prompt("run-1", "medium", 7, 3)
+        second = build_prompt("run-1", "medium", 7, 3)
+
+        self.assertEqual(first, second)
+
     def test_nearest_rank_percentile(self) -> None:
         self.assertEqual(percentile_nearest_rank([1, 2, 3, 4], 0.95), 4.0)
 
