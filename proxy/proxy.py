@@ -40,6 +40,7 @@ from proxy.resource import p_control_plane
 from proxy.resource.hb_log import HeartbeatReporter, hb_report_loop
 from proxy.strategy.factory import build_instance_strategy
 from proxy.strategy.linucb import LinUCBStrategy, Decision, ttft_reward
+from proxy.strategy.candidate_filter import filter_safe_instances
 from proxy.queue import QueueManager, ProxyTask
 from proxy.metrics.prometheus_cache import PrometheusCache
 
@@ -548,6 +549,33 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
         return chosen, None, selection_trace
 
     try:
+        cache: PrometheusCache = app.state.prometheus_cache  # type: ignore
+        safe_instances, excluded_instances = filter_safe_instances(
+            instances,
+            metric_for=cache.get,
+            queue_snapshot_for=queue_mgr.get_instance_rl_snapshot,
+            metric_stale_s=config.PROXY_RL_PROMETHEUS_STALE_S,
+            metric_failure_limit=config.PROXY_RL_PROMETHEUS_FAILURE_LIMIT,
+            kv_usage_limit=config.PROXY_RL_KV_USAGE_LIMIT,
+        )
+        selection_trace.update({
+            "safe_instance_count": len(safe_instances),
+            "excluded_instances": excluded_instances,
+            # Preserve the existing keys consumed by experiment analysis.
+            "linucb_safe_instance_count": len(safe_instances),
+            "linucb_excluded_instances": excluded_instances,
+        })
+        if not safe_instances:
+            selection_trace.update({
+                "selection_phase": "failed",
+                "selection_reason": "no_safe_instances",
+            })
+            return None, None, selection_trace
+
+        # Every policy and LinUCB fallback receives this same ordered list.
+        # No later branch may restore the broader alive list.
+        instances = safe_instances
+
         if not config.PROXY_RL_ENABLED:
             applied_strategy = (
                 build_instance_strategy("least_inflight")
@@ -586,7 +614,6 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
                 "linucb_requires_kvcache",
             )
 
-        cache: PrometheusCache = app.state.prometheus_cache  # type: ignore
         context_started_ns = time.perf_counter_ns()
         kdn_addr = str(getattr(req_obj.Task, "KDN_server_addr", "") or "")
         knowledge_len = max(0, int(getattr(service, "Knowledge_length", 0) or 0))
@@ -601,27 +628,7 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
             float(kvcache_service.get("residual_prefill_ms", 0) or 0),
         )
         contexts: Dict[str, Dict[str, Any]] = {}
-        safe_instances = []
-        excluded_instances: Dict[str, str] = {}
         for item in instances:
-            metric = cache.get(item.instance_id)
-            if metric is None:
-                excluded_instances[item.instance_id] = "metrics_missing"
-                continue
-            if not metric.is_fresh(config.PROXY_RL_PROMETHEUS_STALE_S):
-                excluded_instances[item.instance_id] = "metrics_stale"
-                continue
-            if metric.failures >= config.PROXY_RL_PROMETHEUS_FAILURE_LIMIT:
-                excluded_instances[item.instance_id] = "metrics_failures"
-                continue
-            if metric.kv_usage >= config.PROXY_RL_KV_USAGE_LIMIT:
-                excluded_instances[item.instance_id] = "kv_usage_limit"
-                continue
-            q = queue_mgr.get_instance_rl_snapshot(item.instance_id)
-            if q["prepare_queue_size"] >= 256 or q["ready_queue_size"] >= 256:
-                excluded_instances[item.instance_id] = "proxy_queue_limit"
-                continue
-
             meta = item.meta or {}
             compute_capacity = max(
                 1e-6,
@@ -685,24 +692,15 @@ async def select_instance(app: FastAPI, req_obj: SchedulerRequest) -> Tuple[Any,
                 ),
                 "kv_latency_ms": latency_ms,
             }
-            safe_instances.append(item)
         context_build_us = (time.perf_counter_ns() - context_started_ns) // 1000
         selection_trace.update({
-            "linucb_safe_instance_count": len(safe_instances),
-            "linucb_excluded_instances": excluded_instances,
             "rl_context_build_us": int(context_build_us),
         })
-        if len(safe_instances) < 2:
-            return choose_and_reserve(
-                build_instance_strategy("least_inflight"),
-                "fallback",
-                "insufficient_safe_linucb_candidates",
-            )
 
         score_started_ns = time.perf_counter_ns()
-        decision = strategy.choose(safe_instances, contexts)
+        decision = strategy.choose(instances, contexts)
         score_us = (time.perf_counter_ns() - score_started_ns) // 1000
-        chosen = next(item for item in safe_instances if item.instance_id == decision.instance_id)
+        chosen = next(item for item in instances if item.instance_id == decision.instance_id)
         queue_mgr.reserve_route(chosen.instance_id)
         selection_trace.update({
             "applied_instance_strategy": "linucb",
@@ -772,9 +770,17 @@ async def proxy_chat_completions(request: FastAPIRequest):
     chosen, rl_decision, selection_trace = await select_instance(proxy, req_obj)
     route_select_end_ms = int(time.time() * 1000)
     if not chosen:
+        no_safe = selection_trace.get("selection_reason") == "no_safe_instances"
         return JSONResponse(
             status_code=503,
-            content={"error": "no_instance", "detail": "proxy has no alive instance"},
+            content={
+                "error": "no_safe_instance" if no_safe else "no_instance",
+                "detail": (
+                    "proxy has no safe instance"
+                    if no_safe else "proxy has no alive instance"
+                ),
+                "selection_trace": selection_trace,
+            },
         )
 
     host = chosen.host
@@ -950,9 +956,17 @@ async def proxy_completions(request: FastAPIRequest):
     chosen, rl_decision, selection_trace = await select_instance(proxy, req_obj)
     route_select_end_ms = int(time.time() * 1000)
     if not chosen:
+        no_safe = selection_trace.get("selection_reason") == "no_safe_instances"
         return JSONResponse(
             status_code=503,
-            content={"error": "no_instance", "detail": "proxy has no alive instance"},
+            content={
+                "error": "no_safe_instance" if no_safe else "no_instance",
+                "detail": (
+                    "proxy has no safe instance"
+                    if no_safe else "proxy has no alive instance"
+                ),
+                "selection_trace": selection_trace,
+            },
         )
 
     host = chosen.host

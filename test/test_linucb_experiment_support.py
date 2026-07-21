@@ -57,6 +57,14 @@ least_inflight = load_module(
     "proxy.strategy.least_inflight", ROOT / "proxy" / "strategy" / "least_inflight.py"
 )
 LeastInflightStrategy = least_inflight.LeastInflightStrategy
+round_robin = load_module(
+    "proxy.strategy.round_robin", ROOT / "proxy" / "strategy" / "round_robin.py"
+)
+RoundRobinStrategy = round_robin.RoundRobinStrategy
+candidate_filter = load_module(
+    "proxy.strategy.candidate_filter", ROOT / "proxy" / "strategy" / "candidate_filter.py"
+)
+filter_safe_instances = candidate_filter.filter_safe_instances
 ProxyTask = load_module("_proxy_task_under_test", ROOT / "proxy" / "queue" / "task.py").ProxyTask
 
 redis_stub = ModuleType("redis")
@@ -79,6 +87,17 @@ class FakeInstance:
     host: str = "127.0.0.1"
     port: int = 9001
     weight: float = 1.0
+
+
+@dataclass
+class FakeMetric:
+    fresh: bool = True
+    failures: int = 0
+    kv_usage: float = 0.0
+
+    def is_fresh(self, stale_s: float) -> bool:
+        del stale_s
+        return self.fresh
 
 
 def context(compute_ms: float, kv_ready_ms: float = 0.0) -> dict:
@@ -227,6 +246,109 @@ class LinUCBObservabilityTest(unittest.TestCase):
 
         self.assertEqual(strategy.select(instances, hint).instance_id, "inst-0")
         self.assertEqual(strategy.select(instances, hint).instance_id, "inst-1")
+
+
+class SharedCandidateFilterTest(unittest.TestCase):
+    @staticmethod
+    def queue_snapshot(prepare: int = 0, ready: int = 0) -> dict:
+        return {
+            "prepare_queue_size": prepare,
+            "ready_queue_size": ready,
+        }
+
+    def test_filters_every_safety_reason_and_sorts_candidates(self) -> None:
+        instances = [
+            FakeInstance("inst-safe-b"),
+            FakeInstance("inst-queue"),
+            FakeInstance("inst-missing"),
+            FakeInstance("inst-stale"),
+            FakeInstance("inst-failures"),
+            FakeInstance("inst-kv"),
+            FakeInstance("inst-safe-a"),
+        ]
+        metrics = {
+            "inst-safe-a": FakeMetric(),
+            "inst-safe-b": FakeMetric(),
+            "inst-queue": FakeMetric(),
+            "inst-stale": FakeMetric(fresh=False),
+            "inst-failures": FakeMetric(failures=3),
+            "inst-kv": FakeMetric(kv_usage=0.9),
+        }
+
+        safe, excluded = filter_safe_instances(
+            instances,
+            metric_for=metrics.get,
+            queue_snapshot_for=lambda instance_id: self.queue_snapshot(
+                prepare=256 if instance_id == "inst-queue" else 0
+            ),
+            metric_stale_s=3.0,
+            metric_failure_limit=3,
+            kv_usage_limit=0.9,
+        )
+
+        self.assertEqual(
+            [item.instance_id for item in safe],
+            ["inst-safe-a", "inst-safe-b"],
+        )
+        self.assertEqual(excluded, {
+            "inst-failures": "metrics_failures",
+            "inst-kv": "kv_usage_limit",
+            "inst-missing": "metrics_missing",
+            "inst-queue": "proxy_queue_limit",
+            "inst-stale": "metrics_stale",
+        })
+        contexts = {
+            item.instance_id: context(100)
+            for item in safe
+        }
+        self.assertIn(RoundRobinStrategy().select(safe).instance_id, contexts)
+        self.assertIn(LeastInflightStrategy().select(safe).instance_id, contexts)
+        self.assertIn(
+            LinUCBStrategy(warmup_requests=0).choose(safe, contexts).instance_id,
+            contexts,
+        )
+
+    def test_single_safe_candidate_is_not_replaced_by_an_excluded_one(self) -> None:
+        instances = [FakeInstance("inst-excluded"), FakeInstance("inst-safe")]
+        metrics = {
+            "inst-excluded": FakeMetric(fresh=False),
+            "inst-safe": FakeMetric(),
+        }
+        safe, excluded = filter_safe_instances(
+            instances,
+            metric_for=metrics.get,
+            queue_snapshot_for=lambda _: self.queue_snapshot(),
+            metric_stale_s=3.0,
+            metric_failure_limit=3,
+            kv_usage_limit=0.9,
+        )
+
+        self.assertEqual([item.instance_id for item in safe], ["inst-safe"])
+        self.assertEqual(excluded, {"inst-excluded": "metrics_stale"})
+        self.assertEqual(LeastInflightStrategy().select(safe).instance_id, "inst-safe")
+        decision = LinUCBStrategy(warmup_requests=1).choose(
+            safe, {"inst-safe": context(100)}
+        )
+        self.assertEqual(decision.instance_id, "inst-safe")
+
+    def test_no_safe_candidates_returns_empty_without_fallback(self) -> None:
+        instances = [FakeInstance("inst-stale"), FakeInstance("inst-missing")]
+        metrics = {"inst-stale": FakeMetric(fresh=False)}
+
+        safe, excluded = filter_safe_instances(
+            instances,
+            metric_for=metrics.get,
+            queue_snapshot_for=lambda _: self.queue_snapshot(),
+            metric_stale_s=3.0,
+            metric_failure_limit=3,
+            kv_usage_limit=0.9,
+        )
+
+        self.assertEqual(safe, [])
+        self.assertEqual(excluded, {
+            "inst-missing": "metrics_missing",
+            "inst-stale": "metrics_stale",
+        })
 
 
 class TextDatabaseEmbeddingRepairTest(unittest.TestCase):
