@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import unittest
 from dataclasses import dataclass
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, patch
 import sys
 import tempfile
 import time
@@ -349,6 +351,85 @@ class SharedCandidateFilterTest(unittest.TestCase):
             "inst-missing": "metrics_missing",
             "inst-stale": "metrics_stale",
         })
+
+
+class KDNRefreshStabilityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_unchanged_refresh_preserves_indexed_table(self) -> None:
+        class FakeKnowledgeTable:
+            def __init__(self, dim: int = 2, index=None):
+                self.dim = dim
+                self._units = {"kid-1": object(), "kid-2": object()}
+                self._faiss_index = index
+                self.clone_calls = 0
+
+            def clone_without_index(self):
+                self.clone_calls += 1
+                return FakeKnowledgeTable(dim=self.dim, index=None)
+
+        class FakeKnowledgeUnit:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        core_pkg = ModuleType("core")
+        core_pkg.__path__ = []
+        core_config = ModuleType("core.config")
+        core_config.SCHEDULER_KDN_REFRESH_INTERVAL_S_DEFAULT = 30
+        store_pkg = ModuleType("store")
+        store_pkg.__path__ = []
+        knowledge_base = ModuleType("store.knowledge_base")
+        knowledge_base.KnowledgeTable = FakeKnowledgeTable
+        knowledge_base.KnowledgeUnit = FakeKnowledgeUnit
+        scheduler_pkg = ModuleType("scheduler")
+        scheduler_pkg.__path__ = []
+        knowledge_pkg = ModuleType("scheduler.knowledge")
+        knowledge_pkg.__path__ = [str(ROOT / "scheduler" / "knowledge")]
+        resource_pkg = ModuleType("scheduler.resource")
+        resource_pkg.__path__ = []
+        control_plane = ModuleType("scheduler.resource.control_plane")
+        control_plane._hb_agg = None
+        kdn_client = ModuleType("scheduler.knowledge.kdn_client")
+        kdn_client.fetch_kdn_snapshot = AsyncMock(return_value=[])
+        kdn_client.fetch_kdn_items_by_kids = AsyncMock(return_value=[])
+
+        module_stubs = {
+            "core": core_pkg,
+            "core.config": core_config,
+            "store": store_pkg,
+            "store.knowledge_base": knowledge_base,
+            "scheduler": scheduler_pkg,
+            "scheduler.knowledge": knowledge_pkg,
+            "scheduler.resource": resource_pkg,
+            "scheduler.resource.control_plane": control_plane,
+            "scheduler.knowledge.kdn_client": kdn_client,
+        }
+        with patch.dict(sys.modules, module_stubs):
+            kdn_sync = load_module(
+                "scheduler.knowledge._kdn_sync_under_test",
+                ROOT / "scheduler" / "knowledge" / "kdn_sync.py",
+            )
+
+        old_index = object()
+        old_table = FakeKnowledgeTable(index=old_index)
+        app = SimpleNamespace(
+            state=SimpleNamespace(
+                _kdn_refresh_lock=asyncio.Lock(),
+                knowledge_table=old_table,
+            )
+        )
+        kdn_sync.refresh_kdn_knowledge_index = AsyncMock(return_value={})
+        kdn_sync.select_kdn_base_url = AsyncMock(
+            return_value=("http://127.0.0.1:9101", ["kdn://127.0.0.1:9101"])
+        )
+        kdn_sync.fetch_kdn_snapshot = AsyncMock(return_value=[])
+        kdn_sync.diff_kdn_meta = lambda _: ([], [], [])
+
+        result = await kdn_sync.kdn_refresh_once(app)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["entries"], 2)
+        self.assertEqual(old_table.clone_calls, 1)
+        self.assertIs(app.state.knowledge_table, old_table)
+        self.assertIs(app.state.knowledge_table._faiss_index, old_index)
 
 
 class TextDatabaseEmbeddingRepairTest(unittest.TestCase):

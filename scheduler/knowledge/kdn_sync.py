@@ -249,6 +249,11 @@ async def kdn_refresh_once(app) -> dict:
         # D) build FAISS on new_table (always build for first build; otherwise only if changed)
         if old_table is None or changed:
             new_table.build_faiss_index()
+        else:
+            # clone_without_index() intentionally drops FAISS. When the KDN
+            # snapshot is unchanged, keep the already indexed table instead
+            # of swapping in an equivalent table without an index.
+            new_table = old_table
 
         # E) atomic swap
         app.state.knowledge_table = new_table
