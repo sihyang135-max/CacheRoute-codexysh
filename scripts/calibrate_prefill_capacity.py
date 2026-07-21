@@ -31,7 +31,7 @@ def parse_csv_ints(raw: str, name: str) -> List[int]:
 def build_prompt(run_id: str, length_label: str, request_index: int, repetitions: int) -> str:
     key = f"{run_id}:{length_label}:{request_index}"
     nonce = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    return f"nonce={nonce}\n" + (" calibration" * repetitions)
+    return f"nonce={nonce}\n" + (" a" * repetitions)
 
 
 def percentile_nearest_rank(values: Sequence[float], percentile: float) -> float:

@@ -15,7 +15,7 @@ class PrefillCalibrationTest(unittest.TestCase):
         second = build_prompt("run-1", "short", 2, 3)
 
         self.assertTrue(first.startswith("nonce="))
-        self.assertEqual(first.count(" calibration"), 3)
+        self.assertEqual(first.count(" a"), 3)
         self.assertNotEqual(first.splitlines()[0], second.splitlines()[0])
 
     def test_nearest_rank_percentile(self) -> None:
