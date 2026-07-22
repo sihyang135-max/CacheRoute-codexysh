@@ -88,6 +88,7 @@ start_stack() {
   PROXY_RL_MODEL_LOAD_PATH="$load_path" PROXY_RL_MODEL_SAVE_PATH="$container_model" PROXY_RL_SOURCE_COMMIT="$EXPECTED_COMMIT" PROXY_RL_FROZEN="$frozen" \
   PROXY_RL_PARAMETER_SNAPSHOT_PATH="$container_snapshots" PROXY_RL_PARAMETER_SNAPSHOT_INTERVAL="$SNAPSHOT_INTERVAL" \
   KDN_TEXT_DB_DIR="$container_run_dir/kdn-text-db" \
+  KDN_KV_DB_DIR="$container_run_dir/kdn-kv-db" \
   PROXY_RL_KV_RESIDENCY_SCOPE=global PROXY_RL_KV_LINK_SCOPE=global bash "$PROJECT_HOST/scripts/start_rl4_signal_smoke.sh"
   cp "$PROJECT_HOST/log/rl4/status.txt" "$host_run_dir/${mode}-startup-status.txt"
 }

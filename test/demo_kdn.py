@@ -10,9 +10,13 @@ if str(ROOT_DIR) not in sys.path:
 from kdn_server.kdn_api import kdn
 from core import config
 
-KDN_TEXT_DB_DIR = ROOT_DIR / "kdn_server" / "text_database"
+KDN_TEXT_DB_DIR = Path(
+    os.environ.get("KDN_TEXT_DB_DIR", str(ROOT_DIR / "kdn_server" / "text_database"))
+).resolve()
 KDN_DATA_YAML = ROOT_DIR / "data" / "kdn_text_base.yaml"
-KDN_KV_DB_DIR = ROOT_DIR / "kdn_server" / "KV_database"
+KDN_KV_DB_DIR = Path(
+    os.environ.get("KDN_KV_DB_DIR", str(ROOT_DIR / "kdn_server" / "KV_database"))
+).resolve()
 
 def build_args():
     parser = argparse.ArgumentParser(description="Run KDN server")

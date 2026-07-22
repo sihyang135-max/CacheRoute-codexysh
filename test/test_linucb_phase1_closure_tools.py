@@ -99,9 +99,13 @@ class RuntimeIsolationTest(unittest.TestCase):
     def test_runtime_writes_are_kept_out_of_tracked_source(self) -> None:
         docker_start = (ROOT / "scripts" / "start_rl_4instance_docker.sh").read_text(encoding="utf-8")
         closure = (ROOT / "scripts" / "run_rl4_phase1_closure.sh").read_text(encoding="utf-8")
+        demo_kdn = (ROOT / "test" / "demo_kdn.py").read_text(encoding="utf-8")
         self.assertIn("docker exec -e PYTHONDONTWRITEBYTECODE=1", docker_start)
         self.assertIn("-e KDN_TEXT_DB_DIR=", docker_start)
         self.assertIn('KDN_TEXT_DB_DIR="$container_run_dir/kdn-text-db"', closure)
+        self.assertIn('KDN_KV_DB_DIR="$container_run_dir/kdn-kv-db"', closure)
+        self.assertIn('os.environ.get("KDN_TEXT_DB_DIR"', demo_kdn)
+        self.assertIn('os.environ.get("KDN_KV_DB_DIR"', demo_kdn)
         self.assertIn('PROXY_RL_SOURCE_COMMIT="$EXPECTED_COMMIT"', closure)
         self.assertLess(
             closure.index("start_stack loaded-training"),
