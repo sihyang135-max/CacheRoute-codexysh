@@ -106,11 +106,13 @@ run_client() {
 
 echo "[PHASE] fresh-training"
 start_stack fresh-training; warmup_engines fresh-training; run_client 240 "$SEED" "$container_run_dir/training-raw.jsonl"
-test -s "$host_model"; test -s "$host_snapshots"; cp "$host_model" "$host_run_dir/model-before/linucb-model.json"
+test -s "$host_model"; test -s "$host_snapshots"
 docker logs "$CONTAINER" > "$host_run_dir/service-logs/fresh-training.log" 2>&1
 
 echo "[PHASE] loaded-training startup/load gate"
-start_stack loaded-training; warmup_engines loaded-training; docker logs "$CONTAINER" > "$host_run_dir/service-logs/loaded-training.log" 2>&1
+start_stack loaded-training
+cp "$host_model" "$host_run_dir/model-before/linucb-model.json"
+warmup_engines loaded-training; docker logs "$CONTAINER" > "$host_run_dir/service-logs/loaded-training.log" 2>&1
 cmp "$host_model" "$host_run_dir/model-before/linucb-model.json"
 
 echo "[PHASE] loaded-frozen"

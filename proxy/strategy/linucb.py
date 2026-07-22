@@ -214,6 +214,11 @@ class LinUCBStrategy(BaseInstanceStrategy):
             self._tie_cursor = int(payload.get("tie_cursor", 0))
             self._model_created_at_unix_ns = int(payload.get("created_at_unix_ns", 0))
             self._loaded_instance_ids = set(restored)
+            self._last_snapshot_updates = self._effective_updates
+            self._last_snapshot_theta = {
+                instance_id: arm["A_inv"] @ arm["b"]
+                for instance_id, arm in restored.items()
+            }
         return payload
 
     @property
@@ -254,7 +259,7 @@ class LinUCBStrategy(BaseInstanceStrategy):
         due = force or updates == self.warmup_requests or (
             updates > 0 and updates % self.parameter_snapshot_interval == 0
         )
-        if not due or (already_recorded and not force):
+        if not due or already_recorded:
             return None
         snapshot = self.parameter_snapshot()
         snapshot["recorded_at_unix_ns"] = time.time_ns()

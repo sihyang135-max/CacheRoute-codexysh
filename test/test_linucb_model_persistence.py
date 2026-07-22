@@ -116,8 +116,10 @@ class LinUCBPersistenceTest(unittest.TestCase):
     def test_checkpoint_writes_theta_at_fixed_interval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             snapshots = Path(temp_dir) / "theta.jsonl"
+            model = Path(temp_dir) / "model.json"
             strategy = LinUCBStrategy(
                 warmup_requests=0,
+                model_save_path=str(model),
                 parameter_snapshot_path=str(snapshots),
                 parameter_snapshot_interval=2,
             )
@@ -130,6 +132,21 @@ class LinUCBPersistenceTest(unittest.TestCase):
             self.assertEqual(rows[0]["feature_names"], [
                 "bias", "compute_delta_norm", "kv_ready_delta_norm"
             ])
+            model_before = model.read_bytes()
+            snapshots_before = snapshots.read_bytes()
+            self.assertIsNone(strategy.checkpoint_if_due(force=True))
+            self.assertEqual(model.read_bytes(), model_before)
+            self.assertEqual(snapshots.read_bytes(), snapshots_before)
+
+            restored = LinUCBStrategy(
+                warmup_requests=0,
+                model_save_path=str(model),
+                parameter_snapshot_path=str(snapshots),
+                parameter_snapshot_interval=2,
+            )
+            restored.load_model(str(model))
+            self.assertIsNone(restored.checkpoint_if_due(force=True))
+            self.assertEqual(snapshots.read_bytes(), snapshots_before)
 
     def test_corrupt_or_mismatched_model_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

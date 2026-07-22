@@ -103,6 +103,10 @@ class RuntimeIsolationTest(unittest.TestCase):
         self.assertIn("-e KDN_TEXT_DB_DIR=", docker_start)
         self.assertIn('KDN_TEXT_DB_DIR="$container_run_dir/kdn-text-db"', closure)
         self.assertIn('PROXY_RL_SOURCE_COMMIT="$EXPECTED_COMMIT"', closure)
+        self.assertLess(
+            closure.index("start_stack loaded-training"),
+            closure.index('cp "$host_model" "$host_run_dir/model-before/linucb-model.json"'),
+        )
 
 
 if __name__ == "__main__":
