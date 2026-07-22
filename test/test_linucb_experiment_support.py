@@ -14,11 +14,12 @@ import time
 
 import numpy as np
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from util.openai_stream import OpenAIStreamObserver
 from kdn_server.text_db import TextDatabase
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_module(name: str, path: Path):

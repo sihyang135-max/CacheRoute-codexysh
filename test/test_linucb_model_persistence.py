@@ -96,9 +96,13 @@ class LinUCBPersistenceTest(unittest.TestCase):
             frozen = LinUCBStrategy(warmup_requests=0, frozen=True)
             frozen.load_model(str(model))
             before = frozen.parameter_snapshot()
+            selections_before = frozen.effective_selections
             decision = frozen.choose(self.instances, self.contexts)
             self.assertFalse(frozen.update(decision.instance_id, decision.features, -1.0))
-            self.assertEqual(before, frozen.parameter_snapshot())
+            after = frozen.parameter_snapshot()
+            self.assertEqual(before["effective_updates"], after["effective_updates"])
+            self.assertEqual(before["arms"], after["arms"])
+            self.assertEqual(frozen.effective_selections, selections_before + 1)
 
     def test_checkpoint_writes_theta_at_fixed_interval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
