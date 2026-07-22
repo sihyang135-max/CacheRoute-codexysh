@@ -77,6 +77,7 @@ class LinUCBStrategy(BaseInstanceStrategy):
         kv_ready_scale_ms: float = config.PROXY_RL_KV_READY_COST_SCALE_MS,
         frozen: bool = config.PROXY_RL_FROZEN,
         model_save_path: str = config.PROXY_RL_MODEL_SAVE_PATH,
+        source_commit: str = config.PROXY_RL_SOURCE_COMMIT,
         parameter_snapshot_path: str = config.PROXY_RL_PARAMETER_SNAPSHOT_PATH,
         parameter_snapshot_interval: int = config.PROXY_RL_PARAMETER_SNAPSHOT_INTERVAL,
     ) -> None:
@@ -87,6 +88,8 @@ class LinUCBStrategy(BaseInstanceStrategy):
         self.kv_ready_scale_ms = max(1.0, float(kv_ready_scale_ms))
         self.frozen = bool(frozen)
         self.model_save_path = str(model_save_path or "").strip()
+        self.source_commit = str(source_commit or "").strip()
+        self._model_created_at_unix_ns = time.time_ns()
         self.parameter_snapshot_path = str(parameter_snapshot_path or "").strip()
         self.parameter_snapshot_interval = max(1, int(parameter_snapshot_interval))
         self._feature_names = (
@@ -115,6 +118,8 @@ class LinUCBStrategy(BaseInstanceStrategy):
             "warmup_requests": self.warmup_requests,
             "compute_scale_ms": self.compute_scale_ms,
             "kv_ready_scale_ms": self.kv_ready_scale_ms,
+            "source_commit": self.source_commit,
+            "created_at_unix_ns": self._model_created_at_unix_ns,
             "effective_updates": self._effective_updates,
             "effective_selections": self._effective_selections,
             "tie_cursor": self._tie_cursor,
@@ -168,6 +173,7 @@ class LinUCBStrategy(BaseInstanceStrategy):
             "warmup_requests": self.warmup_requests,
             "compute_scale_ms": self.compute_scale_ms,
             "kv_ready_scale_ms": self.kv_ready_scale_ms,
+            "source_commit": self.source_commit,
             "matrix_kind": "A_inv",
         }
         for key, value in expected.items():
@@ -206,8 +212,15 @@ class LinUCBStrategy(BaseInstanceStrategy):
             self._effective_updates = int(payload.get("effective_updates", 0))
             self._effective_selections = int(payload.get("effective_selections", 0))
             self._tie_cursor = int(payload.get("tie_cursor", 0))
+            self._model_created_at_unix_ns = int(payload.get("created_at_unix_ns", 0))
             self._loaded_instance_ids = set(restored)
         return payload
+
+    @property
+    def runtime_mode(self) -> str:
+        if self._loaded_instance_ids is None:
+            return "fresh-training"
+        return "loaded-frozen" if self.frozen else "loaded-training"
 
     def parameter_snapshot(self) -> Dict[str, Any]:
         with self._lock:

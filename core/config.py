@@ -116,6 +116,7 @@ PROXY_RL_KV_RESIDENCY_SCOPE = os.environ.get("PROXY_RL_KV_RESIDENCY_SCOPE", "glo
 PROXY_RL_KV_LINK_SCOPE = os.environ.get("PROXY_RL_KV_LINK_SCOPE", "global").strip().lower()
 PROXY_RL_MODEL_LOAD_PATH = os.environ.get("PROXY_RL_MODEL_LOAD_PATH", "").strip()
 PROXY_RL_MODEL_SAVE_PATH = os.environ.get("PROXY_RL_MODEL_SAVE_PATH", "").strip()
+PROXY_RL_SOURCE_COMMIT = os.environ.get("PROXY_RL_SOURCE_COMMIT", "").strip()
 PROXY_RL_FROZEN = bool(int(os.environ.get("PROXY_RL_FROZEN", "0")))
 PROXY_RL_PARAMETER_SNAPSHOT_PATH = os.environ.get(
     "PROXY_RL_PARAMETER_SNAPSHOT_PATH", ""

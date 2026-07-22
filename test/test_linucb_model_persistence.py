@@ -20,6 +20,7 @@ core_stub.config = SimpleNamespace(
     PROXY_RL_KV_READY_COST_SCALE_MS=1000.0,
     PROXY_RL_FROZEN=False,
     PROXY_RL_MODEL_SAVE_PATH="",
+    PROXY_RL_SOURCE_COMMIT="",
     PROXY_RL_PARAMETER_SNAPSHOT_PATH="",
     PROXY_RL_PARAMETER_SNAPSHOT_INTERVAL=20,
 )
@@ -88,6 +89,14 @@ class LinUCBPersistenceTest(unittest.TestCase):
                     after.candidate_scores[instance_id],
                     places=12,
                 )
+            self.assertIn("created_at_unix_ns", restored.save_model(str(model)))
+
+    def test_source_commit_is_strict_model_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model = Path(temp_dir) / "model.json"
+            self.trained(source_commit="a" * 40).save_model(str(model))
+            with self.assertRaisesRegex(ValueError, "metadata mismatch for source_commit"):
+                LinUCBStrategy(warmup_requests=0, source_commit="b" * 40).load_model(str(model))
 
     def test_frozen_model_does_not_update(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
