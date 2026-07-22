@@ -95,5 +95,15 @@ class ClosureValidationTest(unittest.TestCase):
         self.assertFalse(result["checks"]["frozen_never_updates"])
 
 
+class RuntimeIsolationTest(unittest.TestCase):
+    def test_runtime_writes_are_kept_out_of_tracked_source(self) -> None:
+        docker_start = (ROOT / "scripts" / "start_rl_4instance_docker.sh").read_text(encoding="utf-8")
+        closure = (ROOT / "scripts" / "run_rl4_phase1_closure.sh").read_text(encoding="utf-8")
+        self.assertIn("docker exec -e PYTHONDONTWRITEBYTECODE=1", docker_start)
+        self.assertIn("-e KDN_TEXT_DB_DIR=", docker_start)
+        self.assertIn('KDN_TEXT_DB_DIR="$container_run_dir/kdn-text-db"', closure)
+        self.assertIn('PROXY_RL_SOURCE_COMMIT="$EXPECTED_COMMIT"', closure)
+
+
 if __name__ == "__main__":
     unittest.main()
