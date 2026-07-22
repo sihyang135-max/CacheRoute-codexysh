@@ -43,6 +43,10 @@ core_stub.config = SimpleNamespace(
     PROXY_RL_WARMUP_REQUESTS=30,
     PROXY_RL_COMPUTE_COST_SCALE_MS=1000.0,
     PROXY_RL_KV_READY_COST_SCALE_MS=1000.0,
+    PROXY_RL_FROZEN=False,
+    PROXY_RL_MODEL_SAVE_PATH="",
+    PROXY_RL_PARAMETER_SNAPSHOT_PATH="",
+    PROXY_RL_PARAMETER_SNAPSHOT_INTERVAL=20,
 )
 sys.modules["core"] = core_stub
 proxy_pkg = ModuleType("proxy")

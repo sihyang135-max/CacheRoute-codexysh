@@ -114,6 +114,15 @@ PROXY_RL_KV_READY_COST_SCALE_MS = float(os.environ.get("PROXY_RL_KV_READY_COST_S
 PROXY_RL_DEFAULT_KV_MB_PER_TOKEN = float(os.environ.get("PROXY_RL_DEFAULT_KV_MB_PER_TOKEN", "0.096"))
 PROXY_RL_KV_RESIDENCY_SCOPE = os.environ.get("PROXY_RL_KV_RESIDENCY_SCOPE", "global").strip().lower()
 PROXY_RL_KV_LINK_SCOPE = os.environ.get("PROXY_RL_KV_LINK_SCOPE", "global").strip().lower()
+PROXY_RL_MODEL_LOAD_PATH = os.environ.get("PROXY_RL_MODEL_LOAD_PATH", "").strip()
+PROXY_RL_MODEL_SAVE_PATH = os.environ.get("PROXY_RL_MODEL_SAVE_PATH", "").strip()
+PROXY_RL_FROZEN = bool(int(os.environ.get("PROXY_RL_FROZEN", "0")))
+PROXY_RL_PARAMETER_SNAPSHOT_PATH = os.environ.get(
+    "PROXY_RL_PARAMETER_SNAPSHOT_PATH", ""
+).strip()
+PROXY_RL_PARAMETER_SNAPSHOT_INTERVAL = int(
+    os.environ.get("PROXY_RL_PARAMETER_SNAPSHOT_INTERVAL", "20")
+)
 # ====================================================================#
 #                              Instance                               #
 # ====================================================================#

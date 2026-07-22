@@ -39,7 +39,12 @@ from proxy.resource.instance_pool import InstancePool
 from proxy.resource import p_control_plane
 from proxy.resource.hb_log import HeartbeatReporter, hb_report_loop
 from proxy.strategy.factory import build_instance_strategy
-from proxy.strategy.linucb import LinUCBStrategy, Decision, ttft_reward
+from proxy.strategy.linucb import (
+    LinUCBStrategy,
+    Decision,
+    classify_feedback,
+    ttft_reward,
+)
 from proxy.strategy.candidate_filter import filter_safe_instances
 from proxy.queue import QueueManager, ProxyTask
 from proxy.metrics.prometheus_cache import PrometheusCache
@@ -132,6 +137,18 @@ async def lifespan(app: FastAPI):
     strategy_name = os.environ.get("PROXY_INSTANCE_STRATEGY", "round_robin")
     try:
         app.state.instance_strategy = build_instance_strategy(strategy_name)  # type: ignore
+        strategy = app.state.instance_strategy  # type: ignore
+        if isinstance(strategy, LinUCBStrategy):
+            if strategy.frozen and not config.PROXY_RL_MODEL_LOAD_PATH:
+                raise ValueError("PROXY_RL_FROZEN=1 requires PROXY_RL_MODEL_LOAD_PATH")
+            if config.PROXY_RL_MODEL_LOAD_PATH:
+                strategy.load_model(config.PROXY_RL_MODEL_LOAD_PATH)
+                logger.info(
+                    "[Proxy][LinUCB] loaded model path=%s frozen=%s updates=%s",
+                    config.PROXY_RL_MODEL_LOAD_PATH,
+                    strategy.frozen,
+                    strategy.effective_updates,
+                )
         logger.info("[Proxy] instance strategy=%s", strategy_name)
     except Exception as e:
         # 策略初始化失败是致命的（否则业务面无法选择 instance）
@@ -249,6 +266,16 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        strategy = getattr(app.state, "instance_strategy", None)  # type: ignore
+        if (
+            isinstance(strategy, LinUCBStrategy)
+            and strategy.model_save_path
+            and not strategy.frozen
+        ):
+            try:
+                strategy.checkpoint_if_due(force=True)
+            except Exception as exc:
+                logger.error("[Proxy][LinUCB] final model save failed: %s", exc)
         # 关闭控制平面
         try:
             srv = getattr(app.state, "_cp_server", None)  # type: ignore
@@ -431,14 +458,24 @@ def _linucb_reward(task: ProxyTask) -> float:
 
 
 def _update_linucb_once(task: ProxyTask) -> None:
-    if task.trace.get("rl_updated"):
+    if task.trace.get("rl_update_decided"):
         return
     features = task.trace.get("rl_features")
     strategy = getattr(proxy.state, "instance_strategy", None)
     if not isinstance(strategy, LinUCBStrategy) or not isinstance(features, list):
         return
+    task.trace["rl_update_decided"] = 1
     first = task.trace.get("first_token_ms")
     enqueued = task.trace.get("proxy_enqueue_ms")
+    outcome, reward_source, should_update = classify_feedback(
+        first,
+        enqueued,
+        task_error=str(task.error or ""),
+        explicit_outcome=str(task.trace.get("outcome_class") or ""),
+    )
+    task.trace["outcome_class"] = outcome
+    task.trace["reward_source"] = reward_source
+    task.trace["rl_updated"] = 0
     if isinstance(first, int) and isinstance(enqueued, int):
         task.trace["rl_observed_ttft_ms"] = max(0, first - enqueued)
     task.trace["rl_slo_ttft_ms"] = int(
@@ -446,10 +483,24 @@ def _update_linucb_once(task: ProxyTask) -> None:
     )
     task.trace["rl_reward_ttft_scale_ms"] = float(config.PROXY_RL_REWARD_TTFT_SCALE_MS)
     task.trace["rl_reward_clip"] = float(config.PROXY_RL_REWARD_CLIP)
-    reward = _linucb_reward(task)
-    strategy.update(task.instance_id, features, reward)
-    task.trace["rl_updated"] = 1
-    task.trace["rl_reward_milli"] = int(reward * 1000)
+    reward = _linucb_reward(task) if should_update else None
+    if reward is not None:
+        task.trace["rl_reward_milli"] = int(reward * 1000)
+    if not should_update:
+        task.trace["rl_update_reason"] = reward_source
+        return
+    updated = strategy.update(task.instance_id, features, float(reward))
+    task.trace["rl_updated"] = 1 if updated else 0
+    task.trace["rl_update_reason"] = "updated" if updated else "frozen"
+    task.trace["rl_model_frozen"] = 1 if strategy.frozen else 0
+    if updated:
+        try:
+            snapshot = strategy.checkpoint_if_due()
+            if snapshot is not None:
+                task.trace["rl_parameter_snapshot_updates"] = snapshot["effective_updates"]
+        except Exception as exc:
+            task.trace["rl_checkpoint_error"] = str(exc)
+            logger.exception("[Proxy][LinUCB] checkpoint failed")
     task.trace["rl_effective_updates_after"] = strategy.effective_updates
     task.trace["rl_arm_updates_after"] = strategy.arm_updates
 
@@ -484,6 +535,11 @@ async def _wrap_chat_stream_with_meta(task: ProxyTask, queue_mgr: QueueManager) 
                         continue
 
                 yield full_line
+    except asyncio.CancelledError:
+        task.error = "client_cancelled"
+        task.trace["outcome_class"] = "client_cancelled"
+        task.trace["client_cancelled_ms"] = int(time.time() * 1000)
+        raise
     except Exception as e:
         task.error = f"stream_wrap_failed: {e}"
         task.trace["stream_exception_ms"] = int(time.time() * 1000)
