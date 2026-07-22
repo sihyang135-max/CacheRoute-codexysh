@@ -230,9 +230,8 @@ for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
       --max-model-len 4096 --max-num-seqs 8 --max-num-batched-tokens 8192 \
       --kv-offloading-backend lmcache --kv-offloading-size 32 \
       --disable-hybrid-kv-cache-manager --kv-cache-metrics
-done
-
-for idx in $(seq 0 $((INSTANCE_COUNT - 1))); do
+  # Separate vLLM startup prevents concurrent engines from selecting the same
+  # temporary torch.distributed TCPStore port before either one binds it.
   wait_http "http://127.0.0.1:$((18000 + idx))/v1/models" "vLLM-${idx}" 300 "vllm-${idx}"
   if ! curl -s "http://127.0.0.1:$((18000 + idx))/metrics" | grep -Eq 'kv_cache_usage|gpu_cache_usage'; then
     echo "[WARN] vLLM-${idx}: KVCache Prometheus metric was not found" | tee -a "$LOG_DIR/status.txt"

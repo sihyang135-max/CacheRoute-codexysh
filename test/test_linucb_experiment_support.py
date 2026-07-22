@@ -480,6 +480,17 @@ class ExperimentLauncherSafetyTest(unittest.TestCase):
         self.assertIn("startup failed; stopping partial stack", source)
         self.assertIn("stale vLLM processes remain after cleanup", source)
 
+    def test_launcher_waits_for_each_vllm_before_starting_the_next(self) -> None:
+        source = (ROOT / "scripts" / "start_rl_4instance_in_container.sh").read_text(
+            encoding="utf-8"
+        )
+        launch = source.index('start_bg "vllm-${idx}"')
+        wait = source.index('wait_http "http://127.0.0.1:$((18000 + idx))/v1/models"')
+        loop_end = source.index("\ndone", launch)
+
+        self.assertLess(launch, wait)
+        self.assertLess(wait, loop_end)
+
 
 class KVResidencyTest(unittest.TestCase):
     class FakePipeline:
